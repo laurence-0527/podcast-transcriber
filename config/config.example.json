@@ -4,14 +4,7 @@
   "transcription": {
     "openai_api_key": "sk-xxxx",
     "openai_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "_note": "阿里云百炼异步文件转录（qwen3-asr-flash-filetrans）"
-  },
-
-  "summary": {
-    "model": "qwen-plus",
-    "api_key": "sk-xxxx",
-    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "_note": "可选 qwen-turbo（更便宜）、qwen-plus（平衡）、qwen-max（最强）"
+    "_note": "阿里云百炼异步文件转录（语音转文字）"
   },
 
   "output": {

@@ -1,8 +1,8 @@
 ---
 name: podcast-transcriber
-version: "2.1.0"
-description: "通用播客智能转录工具：从任意播客单集链接到结构化 PDF 的全自动流水线。支持 JSON-LD / OpenGraph / HTML5 多源元数据抓取，阿里云百炼语音转录，AI 摘要+话题分段，PDF 归档。"
-tags: [podcast, transcription, summary, asr, pdf]
+version: "3.0.0"
+description: "通用播客转录工具：从任意播客链接自动完成元数据抓取、音频下载、语音转文字，输出带时间戳的转录文档。AI 摘要由智能体自身完成，无需额外 LLM API。"
+tags: [podcast, transcription, asr, pdf]
 ---
 
 # Podcast Transcriber — 通用播客转录工具
@@ -16,15 +16,12 @@ tags: [podcast, transcription, summary, asr, pdf]
 
 ## 工作流
 
-收到播客链接后，按以下步骤执行：
-
 ### 1. 确认链接
 - 从用户消息中提取播客链接
 - 如果用户仅想预览信息，使用 `--dry` 模式
-- 如果用户只要摘要不要逐字全文，使用 `--no-fulltext` 模式
 - 如果是纯音频 URL，询问用户提供标题
 
-### 2. 执行处理
+### 2. 执行转录
 ```bash
 cd <项目目录> && python -X utf8 main.py <链接>
 ```
@@ -33,17 +30,36 @@ cd <项目目录> && python -X utf8 main.py <链接>
 - `<链接>`：播客单集网页 URL 或音频 URL
 - `--title`, `-t`：手动指定标题（纯音频 URL 时必需）
 - `--dry`：仅抓取元数据，不下载不转录（无需 API Key）
-- `--no-fulltext`：仅输出摘要和话题索引，不包含逐字全文
 
 **超时设置**：转录耗时取决于播客时长（通常 5-30 分钟），建议设置 timeout 为 600000ms，并使用后台执行。
 
-### 3. 结果交付
-处理完成后：
-- 命令输出显示 Markdown 和 PDF 的完整路径，归档于 `output/` 目录
-- 向用户简要汇报：标题、时长、摘要要点
-- 使用 `present_files` 将 PDF 文件发送给用户
+### 3. 阅读转录文本
+处理完成后，输出保存在 `output/<日期_播客名_标题>/` 目录：
+- `<name>.md` — 带时间戳的转录全文
+- `<name>.pdf` — PDF 版本
 
-### 4. 错误处理
+**读取 .md 文件获取转录内容。**
+
+### 4. 智能体生成摘要（由你完成）
+基于转录文本，使用你自身的模型能力生成：
+- **一句话总结**（20字以内）
+- **核心观点**（3-7条，附时间戳引用）
+- **方法论/框架**（如有）
+- **精彩金句**（3-5句，保留原话+时间戳）
+- **话题分段索引**（按语义切割，每段标注时间范围+概要）
+- **延伸阅读推荐**（如适用）
+
+根据用户需求决定输出详略：
+- 用户要"快速了解" → 只给一句话总结 + 核心观点
+- 用户要"详细笔记" → 完整结构化摘要
+- 用户要"话题索引" → 分段索引 + 每段概要
+
+### 5. 结果交付
+- 向用户呈现摘要（直接在对话中输出）
+- 使用 `present_files` 将 PDF 发送给用户
+- 如用户需要全文，引导其查看 .md 文件
+
+### 6. 错误处理
 - 元数据抓取失败 → 提示用户检查 URL，或手动提供音频链接 + `--title`
 - 音频下载失败 → 检查网络和源站可访问性
 - API Key 过期 → 提醒用户检查环境变量 `DASHSCOPE_API_KEY`
@@ -57,11 +73,11 @@ cd <项目目录> && python -X utf8 main.py <链接>
 - 超过 3 小时的超长节目可能触发 ASR 分片上传，耗时显著增加
 - 工具会缓存音频和转录结果（`audio_cache/`、`transcript_cache/`），重复运行同一集时会提示复用缓存
 - PDF 生成需要 CJK 字体：Windows 自带 SimSun/SimHei；Linux 需安装 `fonts-wqy-zenhei`
-- 依赖：`requests`, `reportlab`, `markdown`, `openai`
+- 依赖：`requests`, `reportlab`, `markdown`（无需 openai）
 
 ## 验证
 
 - `--dry` 模式应输出标题、节目名、时长，无报错
 - 完整运行应在 `output/` 下生成 .md 和 .pdf
-- .md 结构：头部元数据 → AI 摘要 → 话题分段全文（--no-fulltext 时跳过）→ 页脚
+- .md 结构：头部元数据 → 带时间戳的转录全文 → 页脚
 - PDF 文件大小 > 0，页数 > 0

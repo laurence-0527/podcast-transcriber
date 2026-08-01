@@ -10,28 +10,28 @@
 
 后来我找到了一个适合自己的节奏：**先转录，再速读，最后选听。**
 
-1. **批量转录**：把攒下来的单集链接丢给工具，自动完成下载、语音转文字、AI 摘要
-2. **速读筛选**：花 2 分钟读一篇结构化摘要（核心观点 + 金句 + 话题索引），判断这集值不值得花 1 小时去听
+1. **批量转录**：把攒下来的单集链接丢给工具，自动完成下载、语音转文字
+2. **速读筛选**：花 2 分钟读一篇摘要（核心观点 + 金句 + 话题索引），判断这集值不值得花 1 小时去听
 3. **深度收听**：对真正感兴趣的内容，带着话题索引去听，直接跳到最相关的段落
 
 这本质上是一种 **"先广后深"的学习方法**——用 AI 把 1 小时音频压缩成 2 分钟阅读，让你的注意力只花在真正高价值的信息上。播客不再是"听完就忘"的流水账，而是可检索、可回顾、可引用的个人知识资产。
 
-这个工具就是这套方法的自动化实现。
+这个工具负责其中最机械的环节：**下载音频、语音转文字、生成带时间戳的转录文档**。摘要和分析则交给你（或你的 AI 助手）来完成——毕竟，理解内容本来就是学习者的事。
 
 ## 功能
 
-- **一条命令完成全部**：URL → 元数据抓取 → 音频下载 → 语音转文字 → AI 摘要 + 话题分段 → Markdown + PDF
+- **一条命令完成转录**：URL → 元数据抓取 → 音频下载 → 语音转文字 → Markdown + PDF
 - **多源识别**：JSON-LD / OpenGraph / HTML5 audio / 直接音频 URL，不绑定特定平台
-- **AI 深度摘要**：不是简单总结，而是观点提炼 + 方法论框架 + 金句（带时间戳）+ 延伸阅读推荐
-- **话题分段索引**：按内容语义自动切割，每段标注时间范围和内容概要，方便跳转收听
-- **`--no-fulltext` 模式**：只输出摘要和索引，不保存逐字全文——适合"速读筛选"场景
+- **带时间戳的逐字转录**：每句话标注精确时间，方便跳转收听原文
+- **缓存复用**：音频和转录结果本地缓存，重复处理同一集无需重新下载
+- **无 LLM 依赖**：工具本身不调用任何大模型 API（ASR 除外），摘要由你自行完成
 
 ## 快速开始
 
 ### 1. 安装依赖
 
 ```bash
-pip install requests reportlab markdown openai
+pip install requests reportlab markdown
 ```
 
 ### 2. 配置 API Key
@@ -55,9 +55,6 @@ python main.py https://cdn.example.com/audio/ep42.mp3 --title "AI 的未来"
 
 # 仅抓取信息，不转录（预览用）
 python main.py --dry https://example.com/podcast/episode-42
-
-# 仅输出摘要和话题索引，不含逐字全文（速读筛选模式）
-python main.py --no-fulltext https://example.com/podcast/episode-42
 ```
 
 输出保存在 `output/` 目录，每集一个文件夹，包含 Markdown 和 PDF。
@@ -69,18 +66,26 @@ python main.py --no-fulltext https://example.com/podcast/episode-42
 ```
 # 标题
 > 节目 | 来源 | 发布日期 | 时长
+🔗 [收听原播客](url)
 
-## 📋 AI 摘要
-### 一句话总结
-### 核心内容提炼（关键观点 / 方法论 / 重要数据 / 精彩金句）
-### 延伸阅读（节目中提及的 + 主题相关推荐）
-### 关键词
+---
 
-## 📑 全文（按话题分段）        ← --no-fulltext 时跳过此部分
-### 📍 00:00 - 12:35 | 话题标题
-> 内容概要
-[00:00] 逐字转录文本...
+## 📝 转录全文（12,345 字）
+
+[00:00] 大家好，欢迎收听本期节目...
+[00:15] 今天我们要聊的主题是...
+[01:02] 第一个关键点是...
+...
+
+---
+_本文档由播客转录工具自动生成 · 仅供个人学习使用_
 ```
+
+拿到转录文本后，你可以（或让你的 AI 助手）：
+- 生成结构化摘要（核心观点 + 方法论 + 金句）
+- 按话题切割索引（方便跳转收听）
+- 提取行动项或延伸阅读
+- 批量对比多集内容
 
 ## 工作原理
 
@@ -88,8 +93,8 @@ python main.py --no-fulltext https://example.com/podcast/episode-42
 URL 输入
   │
   ├─ podfetch.py      → 网页抓取：JSON-LD / OpenGraph / HTML5 audio
-  ├─ podtranscribe.py → 下载音频 → 百炼异步转录 → 时间戳分段
-  ├─ podsummarize.py  → LLM 摘要 + 话题分段 + 延伸阅读
+  ├─ podtranscribe.py → 下载音频 → 百炼异步 ASR → 时间戳分段
+  ├─ podsummarize.py  → 组装 Markdown 文档
   └─ md2pdf.py        → Markdown → PDF（中英文混排）
   │
   └─ output/<日期_播客名_单集标题>/  ← MD + PDF
@@ -100,11 +105,11 @@ URL 输入
 ```
 ├── main.py               # CLI 入口
 ├── podfetch.py           # 通用元数据抓取
-├── podtranscribe.py      # 音频下载 + 阿里云百炼转录
-├── podsummarize.py       # AI 摘要 + 话题分段 + 文档生成
+├── podtranscribe.py      # 音频下载 + 阿里云百炼 ASR
+├── podsummarize.py       # 转录文档构建 + 输出管理
 ├── podauth.py            # API Key 配置加载
 ├── md2pdf.py             # Markdown → PDF
-├── SKILL.md              # AI Agent 技能描述（可供智能体直接调用）
+├── SKILL.md              # AI Agent 技能描述（供智能体调用）
 ├── config/
 │   └── config.example.json
 └── output/               # 转录产物（gitignore）
@@ -121,13 +126,17 @@ URL 输入
 
 已验证：小宇宙、Apple Podcasts、Spotify（网页版）、TWiT、Libsyn 托管播客等。
 
+## 作为 AI Agent 技能使用
+
+本项目附带 `SKILL.md`，可直接作为智能体技能安装。智能体调用本工具完成转录后，利用自身模型能力生成摘要、话题分段、延伸阅读等——无需额外 LLM API 配置。
+
 ## 常见问题
 
 **Q: 转录一集需要多久？**
 A: 下载 1-3 分钟 + 异步转录 5-15 分钟（取决于音频时长和服务负载）。1 小时播客总计约 10-20 分钟。
 
 **Q: 支持哪些语言？**
-A: 阿里云百炼 ASR 支持中文、英文、日文等多语种。摘要默认中文输出。
+A: 阿里云百炼 ASR 支持中文、英文、日文等多语种。
 
 **Q: PDF 中文乱码？**
 A: 需要 CJK 字体。Windows/macOS 通常自带；Linux 请安装 `fonts-wqy-zenhei`。
@@ -135,7 +144,7 @@ A: 需要 CJK 字体。Windows/macOS 通常自带；Linux 请安装 `fonts-wqy-z
 **Q: 可以批量处理吗？**
 A: 可以。写个简单的 shell 循环即可：
 ```bash
-for url in $(cat urls.txt); do python main.py --no-fulltext "$url"; done
+for url in $(cat urls.txt); do python main.py "$url"; done
 ```
 
 ## 数据流向
@@ -143,10 +152,9 @@ for url in $(cat urls.txt); do python main.py --no-fulltext "$url"; done
 1. **元数据抓取**：从播客网页公开 HTML 提取标题、音频 URL（本地处理）
 2. **音频下载**：从播客 CDN 下载到本地 `audio_cache/`
 3. **语音转录**：音频上传至**阿里云百炼（DashScope）**进行异步识别
-4. **AI 摘要**：转录文本发送至**百炼 LLM API**（默认 qwen-plus）生成摘要
-5. **本地输出**：Markdown + PDF 保存在 `output/`
+4. **本地输出**：Markdown + PDF 保存在 `output/`
 
-步骤 3、4 会将数据传输到阿里云服务器。请确认您有权处理相关内容。
+步骤 3 会将音频数据传输到阿里云服务器。请确认您有权处理相关内容。
 
 ## 免责声明
 

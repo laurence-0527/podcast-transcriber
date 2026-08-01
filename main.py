@@ -5,9 +5,9 @@ main.py — 播客转录工具
   python main.py <播客单集URL>           # 从网页抓取元数据并转录
   python main.py <音频URL> --title "xxx"  # 直接传入音频 URL
   python main.py --dry <URL>              # 仅抓取信息，不转录
-  python main.py --no-fulltext <URL>      # 仅输出摘要+话题索引，不含逐字全文
 
-流程：抓取元数据 → 下载音频 → 语音转录 → AI 摘要+话题分段 → PDF 归档
+流程：抓取元数据 → 下载音频 → 语音转录 → Markdown + PDF 归档
+AI 摘要由调用方智能体自行完成。
 """
 import sys
 import json
@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from podfetch import fetch_episode
 from podtranscribe import download_and_transcribe, load_transcript_cache
-from podsummarize import process_episode, build_markdown_doc, save_document, recycle_existing, _build_dir_name
+from podsummarize import process_episode, _build_dir_name
 from md2pdf import convert as md_to_pdf
 
 LOG_DIR = Path(__file__).parent / "state"
@@ -75,8 +75,7 @@ def _check_cache(episode: dict, config: dict) -> bool:
             return True
 
 
-def process_url(url: str, config: dict, title: str = None, dry_run: bool = False,
-                no_fulltext: bool = False) -> dict:
+def process_url(url: str, config: dict, title: str = None, dry_run: bool = False) -> dict:
     """处理单个播客链接。"""
     print(f"\n{'─'*60}")
     print(f"  🎙️  播客转录")
@@ -109,15 +108,13 @@ def process_url(url: str, config: dict, title: str = None, dry_run: bool = False
         return {"url": url, "title": ep_title, "podcast": podcast,
                 "duration_min": duration_min, "status": "dry_run_ok"}
 
-    # Step 1.5: 检查缓存
+    # Step 2: 检查缓存
     skip = _check_cache(episode, config)
     if skip:
         if episode.get("_skip_quit"):
             return {"url": url, "title": ep_title, "status": "skipped"}
-        # 跳过转录，但继续文档生成
-        pass
 
-    # Step 2: 下载 + 转录
+    # Step 3: 下载 + 转录
     if not episode.get("_from_cache"):
         print("\n⬇️  下载音频并转录...")
         try:
@@ -131,22 +128,14 @@ def process_url(url: str, config: dict, title: str = None, dry_run: bool = False
     else:
         print("\n  📋 使用缓存转录数据")
 
-    # Step 3: 摘要 + 文档
-    print("\n🤖 生成摘要并归档...")
-    try:
-        saved_path = process_episode(episode, config, no_fulltext=no_fulltext)
-    except Exception as e:
-        print(f"  ❌ 摘要生成失败: {e}")
-        output_dir = Path(__file__).parent / config.get("output", {}).get("dir", "output")
-        recycle_existing(episode, output_dir)
-        content = build_markdown_doc(episode, "⚠️ 摘要生成失败，仅保存转录文本。")
-        saved_path = save_document(episode, content)
-        print(f"  ⚠️  已保存降级文档: {saved_path}")
+    # Step 4: 构建文档并归档
+    print("\n📄 构建文档...")
+    saved_path = process_episode(episode, config)
 
     print(f"\n  🎉 转录完成！")
     print(f"  📄 Markdown: {saved_path}")
 
-    # Step 4: PDF
+    # Step 5: PDF
     print("\n📝 转换为 PDF...")
     try:
         pdf_path = md_to_pdf(str(saved_path))
@@ -168,14 +157,12 @@ def process_url(url: str, config: dict, title: str = None, dry_run: bool = False
 
 def main():
     parser = argparse.ArgumentParser(
-        description="播客转录工具 — 从播客链接到结构化 PDF 的全自动流水线",
+        description="播客转录工具 — 从播客链接到转录文档的全自动流水线",
         epilog="示例：python main.py https://example.com/podcast/episode-42"
     )
     parser.add_argument("url", nargs="?", help="播客单集 URL 或音频 URL")
     parser.add_argument("--title", "-t", help="手动指定标题（用于纯音频 URL）")
     parser.add_argument("--dry", action="store_true", help="仅抓取信息，不转录")
-    parser.add_argument("--no-fulltext", action="store_true",
-                        help="仅输出摘要和话题索引，不包含逐字全文")
     args = parser.parse_args()
 
     if not args.url:
@@ -195,8 +182,7 @@ def main():
             print(f"❌ {e}")
             return
 
-    result = process_url(args.url, cfg, title=args.title, dry_run=args.dry,
-                         no_fulltext=args.no_fulltext)
+    result = process_url(args.url, cfg, title=args.title, dry_run=args.dry)
 
     # 汇总
     status = result.get("status", "unknown")
