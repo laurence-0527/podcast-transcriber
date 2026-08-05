@@ -49,8 +49,8 @@ def build_markdown_doc(episode: dict) -> str:
     2. 带时间戳的转录全文
     3. 页脚
     """
-    title = episode.get("title", "未知标题")
-    podcast_name = episode.get("podcast_name", "未知节目")
+    title = episode.get("title") or "未知标题"
+    podcast_name = episode.get("podcast_name") or "未知节目"
     source = episode.get("source", "")
     published_at = (episode.get("published_at", "") or "")[:10]
     episode_url = episode.get("episode_url", "")
