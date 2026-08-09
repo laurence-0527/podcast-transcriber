@@ -250,6 +250,82 @@ def _parse_rss_enclosure(html: str, base_url: str) -> Optional[dict]:
     return None
 
 
+# ── YouTube 支持（依赖 yt-dlp）──
+
+YOUTUBE_RE = re.compile(
+    r'(youtube\.com/(watch\?|shorts/|live/|embed/)|youtu\.be/)', re.IGNORECASE
+)
+
+
+def _is_youtube_url(url: str) -> bool:
+    return bool(YOUTUBE_RE.search(url))
+
+
+def _episode_from_youtube(url: str, proxy: str = "") -> dict:
+    """用 yt-dlp 解析 YouTube 视频，提取最佳音频流的直链"""
+    import shutil
+    import subprocess
+
+    if not shutil.which("yt-dlp"):
+        raise RuntimeError(
+            "解析 YouTube 链接需要 yt-dlp，请先安装：pip install yt-dlp"
+        )
+
+    print(f"  🎬 检测到 YouTube 链接，使用 yt-dlp 解析...")
+    cmd = [
+        "yt-dlp", "--dump-single-json", "--no-playlist",
+        "--no-warnings", "-f", "bestaudio/best",
+    ]
+    if proxy:
+        cmd += ["--proxy", proxy]
+        print(f"  🌐 使用代理: {proxy}")
+    cmd.append(url)
+    proc = subprocess.run(cmd, capture_output=True, timeout=180)
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip().splitlines()
+        last = stderr[-1] if stderr else "unknown"
+        hint = ""
+        low = " ".join(stderr).lower()
+        if any(kw in low for kw in ("timed out", "timeout", "10054", "reset", "unreachable", "refused")):
+            hint = "（当前网络可能无法访问 YouTube，可设置 HTTPS_PROXY 环境变量或开启代理后重试）"
+        raise RuntimeError(f"yt-dlp 解析 YouTube 失败: {last[:200]} {hint}")
+
+    info = json.loads(proc.stdout.decode("utf-8", errors="replace"))
+    audio_url = info.get("url", "")
+    if not audio_url:
+        raise RuntimeError("yt-dlp 未能获取 YouTube 音频直链")
+
+    description = (info.get("description") or "")[:300]
+
+    # 标题去掉 yt-dlp 追加的 "| 频道名" / "- 频道名" 尾巴
+    title = info.get("title", "")
+    channel = info.get("channel") or info.get("uploader") or ""
+    if channel:
+        for sep in (" | ", " - ", " _ "):
+            suffix = sep + channel
+            if title.endswith(suffix):
+                title = title[: -len(suffix)].strip()
+                break
+
+    # 发布日期 YYYYMMDD -> YYYY-MM-DD
+    upload_date = info.get("upload_date", "") or ""
+    if len(upload_date) == 8 and upload_date.isdigit():
+        upload_date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
+
+    return {
+        "id": info.get("id", ""),
+        "title": title,
+        "podcast_name": channel,
+        "description": description,
+        "duration_seconds": int(info.get("duration") or 0),
+        "audio_url": audio_url,
+        "cover_url": info.get("thumbnail", ""),
+        "published_at": upload_date,
+        "episode_url": info.get("webpage_url") or url,
+        "source": "youtube",
+    }
+
+
 # ── 主入口 ──
 
 AUDIO_EXTENSIONS = re.compile(r'\.(mp3|m4a|wav|ogg|aac|flac|opus)(\?.*)?$', re.IGNORECASE)
@@ -283,19 +359,32 @@ def _episode_from_audio_url(url: str) -> dict:
     }
 
 
-def fetch_episode(url: str) -> dict:
+def fetch_episode(url: str, proxy: str = "") -> dict:
     """
     从播客单集页面提取元数据。
     若为直接音频 URL（.mp3/.m4a 等），直接构造 episode 跳过网页解析。
     网页解析优先级：JSON-LD > OpenGraph meta > HTML5 audio > RSS enclosure
+    proxy: 可选 HTTP 代理（访问 YouTube 等受限站点时需要）
     """
     # 直接音频 URL：跳过网页解析
     if _is_direct_audio_url(url):
         print(f"  🎵 检测到直接音频链接，跳过网页解析")
         return _episode_from_audio_url(url)
 
+    # YouTube 链接：用 yt-dlp 提取音频直链
+    if _is_youtube_url(url):
+        return _episode_from_youtube(url, proxy=proxy)
+
     print(f"  🔗 抓取页面: {url[:80]}...")
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20, proxies=proxies)
+    except requests.exceptions.ProxyError:
+        if proxies:
+            print(f"  ⚠️  代理不可用，回退为直连...")
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+        else:
+            raise
     resp.raise_for_status()
     html = resp.text
 
