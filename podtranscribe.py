@@ -1,20 +1,27 @@
 """
-podtranscribe.py — 音频下载 + 转录模块
-使用阿里云百炼异步文件转录接口（统一走异步，确保返回时间戳分段）
+podtranscribe.py — 音频下载 + ASR 转录模块
+默认本地管线：faster-whisper（Whisper large-v3，CPU int8）识别 + FunASR ct-punc
+标点恢复 + 句级合并，输出与百炼 Paraformer 相当的句级分段，无需 API Key；
+可选百炼/DashScope ASR；faster-whisper 不可用时回退 openai-whisper。
 
-流程：下载音频 → [优先URL直连/回退curl上传] → 百炼异步转录 → 轮询结果 → 解析带时间戳的转录文本
+流程：下载音频 → 按配置选择 ASR 后端 → 解析带时间戳的转录文本
 """
 
-import time
 import hashlib
 import json
-import subprocess
-import requests
-from typing import Optional
+import os
+import re
+import time
+from pathlib import Path
 from datetime import datetime
+
+# Windows + Anaconda 环境下 ctranslate2 与 MKL 各带一份 OpenMP 运行时，
+# 不设此变量会在推理时 abort（libiomp5md.dll already initialized）
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from pathlib import Path
 
 AUDIO_CACHE = Path(__file__).parent / "audio_cache"
 AUDIO_CACHE.mkdir(exist_ok=True)
@@ -23,35 +30,24 @@ AUDIO_CACHE.mkdir(exist_ok=True)
 TRANSCRIPT_CACHE = Path(__file__).parent / "transcript_cache"
 TRANSCRIPT_CACHE.mkdir(exist_ok=True)
 
-# 百炼异步转录
-DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/api/v1"
-FILETRANS_MODEL = "fun-asr"
 
-# 热词管理
-HOTWORD_MODEL = "speech-biasing"
-HOTWORD_PREFIX = "pod"  # 热词表前缀（全账号共享，最多 10 个）
+# ─────────────────────────────────────────
+# 音频下载
+# ─────────────────────────────────────────
 
-
-def _clear_proxy_env():
-    """清除代理环境变量，返回被清除的变量以便恢复"""
-    import os
-    old_env = {}
-    for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
-        if key in os.environ:
-            old_env[key] = os.environ.pop(key)
-    return old_env
-
-
-def _restore_proxy_env(old_env: dict):
-    """恢复代理环境变量"""
-    import os
-    os.environ.update(old_env)
+def get_cache_path(episode_id: str, url: str) -> Path:
+    """根据 episode_id 确定本地缓存路径"""
+    ext = ".mp3"
+    for candidate in [".m4a", ".aac", ".ogg", ".opus", ".mp3", ".wav", ".flac"]:
+        if candidate in url:
+            ext = candidate
+            break
+    return AUDIO_CACHE / f"{episode_id}{ext}"
 
 
 def _get_session() -> requests.Session:
-    """创建带自动重试的 requests Session（无代理）"""
+    """创建带自动重试的 requests Session"""
     session = requests.Session()
-    session.trust_env = False  # 忽略环境变量中的代理
     retry = Retry(
         total=3,
         backoff_factor=2,
@@ -64,24 +60,10 @@ def _get_session() -> requests.Session:
     return session
 
 
-# ─────────────────────────────────────────
-# 音频下载
-# ─────────────────────────────────────────
-
-def get_cache_path(episode_id: str, url: str) -> Path:
-    """根据 episode_id 确定本地缓存路径"""
-    ext = ".mp3"
-    for candidate in [".m4a", ".aac", ".ogg", ".opus", ".mp3"]:
-        if candidate in url:
-            ext = candidate
-            break
-    return AUDIO_CACHE / f"{episode_id}{ext}"
-
-
-def download_audio(episode: dict, force: bool = False) -> Path:
+def download_audio(episode: dict, force: bool = False, proxy: str = "") -> Path:
     """
     下载播客音频，返回本地文件路径。
-    已缓存则跳过，支持断点续传。
+    已缓存则跳过，支持断点续传。proxy 非空时经代理下载（代理失败自动回退直连）。
     """
     audio_url = episode.get("audio_url", "")
     episode_id = episode.get("id") or hashlib.md5(audio_url.encode()).hexdigest()[:8]
@@ -110,13 +92,23 @@ def download_audio(episode: dict, force: bool = False) -> Path:
     if existing_size > 0:
         headers["Range"] = f"bytes={existing_size}-"
 
-    # 下载连接重试（DNS/瞬时网络错误）
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+
     last_error = None
     for attempt in range(1, 4):
         try:
-            resp = requests.get(audio_url, headers=headers, stream=True, timeout=(30, 1800))
+            resp = requests.get(audio_url, headers=headers, stream=True,
+                                timeout=(30, 1800), proxies=proxies)
             resp.raise_for_status()
             break
+        except requests.exceptions.ProxyError as e:
+            if proxies:
+                print(f"\n  ⚠️  代理连接失败，回退为直连重试...")
+                proxies = None
+                existing_size = 0
+                headers.pop("Range", None)
+                continue
+            raise
         except Exception as e:
             last_error = e
             err_msg = str(e)
@@ -135,7 +127,7 @@ def download_audio(episode: dict, force: bool = False) -> Path:
     mode = "ab" if existing_size > 0 else "wb"
 
     downloaded = existing_size
-    expected_total = total + existing_size  # 断点续传时预期总大小
+    expected_total = total + existing_size
     with open(cache_path, mode) as f:
         for chunk in resp.iter_content(chunk_size=1024 * 512):
             f.write(chunk)
@@ -144,7 +136,6 @@ def download_audio(episode: dict, force: bool = False) -> Path:
                 pct = downloaded / (total + existing_size) * 100
                 print(f"\r  下载中... {pct:.0f}% ({downloaded/1024/1024:.1f}MB)", end="")
 
-    # 验证下载完整性
     final_size = cache_path.stat().st_size
     if total > 0 and final_size < expected_total * 0.95:
         print(f"\n  ⚠️  下载不完整！预期 {expected_total/1024/1024:.1f}MB，实际 {final_size/1024/1024:.1f}MB")
@@ -156,558 +147,510 @@ def download_audio(episode: dict, force: bool = False) -> Path:
 
 
 # ─────────────────────────────────────────
-# 热词管理（Fun-ASR 热词增强）
+# ASR 路由：本地 Whisper / 百炼 DashScope
 # ─────────────────────────────────────────
 
-def _build_hotwords(episode: dict) -> list:
+def _get_bailian_api_key(bailian_cfg: dict) -> str:
+    """读取百炼 API Key：配置 > 环境变量"""
+    key = (bailian_cfg.get("api_key") or "").strip()
+    if not key:
+        key = (os.environ.get("DASHSCOPE_API_KEY") or "").strip()
+    if not key:
+        raise ValueError(
+            "asr.backend='bailian' 需要提供百炼 API Key："
+            "在 config.json 的 bailian.api_key 中填写，或设置环境变量 DASHSCOPE_API_KEY"
+        )
+    return key
+
+
+def _upload_file_to_bailian(audio_path: Path, api_key: str) -> tuple[str, str]:
+    """把本地音频上传到百炼文件服务，返回 (file_id, public_url)"""
+    base_url = "https://dashscope.aliyuncs.com/api/v1/files"
+    with open(audio_path, "rb") as f:
+        files = {"files": (audio_path.name, f, "audio/mpeg")}
+        data = {"purpose": "file-extract"}
+        resp = requests.post(
+            base_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            files=files,
+            data=data,
+            timeout=(30, 300),
+        )
+    resp.raise_for_status()
+    payload = resp.json()
+    uploaded = payload.get("data", {}).get("uploaded_files", [])
+    if not uploaded:
+        failed = payload.get("data", {}).get("failed_uploads", [])
+        msg = failed[0].get("message", "unknown") if failed else "unknown"
+        raise RuntimeError(f"百炼文件上传失败: {msg}")
+
+    file_id = uploaded[0]["file_id"]
+    # 获取可公开访问的临时下载链接，供 Paraformer 识别使用
+    detail_resp = requests.get(
+        f"{base_url}/{file_id}",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=(30, 60),
+    )
+    detail_resp.raise_for_status()
+    file_url = detail_resp.json().get("data", {}).get("url", "")
+    if not file_url:
+        raise RuntimeError("百炼文件上传成功，但未能获取到可识别的下载链接")
+    return file_id, file_url
+
+
+def _transcribe_bailian(audio_path: Path, config: dict, episode: dict = None) -> dict:
+    """使用百炼/DashScope Paraformer 转录音频"""
+    from http import HTTPStatus
+    from dashscope.audio.asr import Transcription
+    import dashscope
+
+    bailian_cfg = config.get("bailian", {})
+    api_key = _get_bailian_api_key(bailian_cfg)
+    dashscope.api_key = api_key
+    if bailian_cfg.get("base_url"):
+        dashscope.base_http_api_url = bailian_cfg["base_url"]
+
+    model = bailian_cfg.get("model", "paraformer-v2")
+    language_hints = bailian_cfg.get("language_hints", ["zh", "en"])
+    disfluency = bailian_cfg.get("disfluency_removal_enabled", False)
+    timestamp_align = bailian_cfg.get("timestamp_alignment_enabled", True)
+
+    file_size = audio_path.stat().st_size
+    print(f"  🎙️  开始百炼转录（{model}）: {audio_path.name} ({file_size/1024/1024:.1f}MB)")
+    start_time = time.time()
+
+    # 上传本地文件到百炼文件服务，并拿到公网可访问的临时 URL
+    print("  ⬆️  上传音频到百炼...")
+    file_id, file_url = _upload_file_to_bailian(audio_path, api_key)
+    print(f"  ✅ 上传完成，file_id: {file_id[:16]}...")
+
+    # 提交识别任务
+    print("  ⏳ 提交识别任务...")
+    task_response = Transcription.async_call(
+        model=model,
+        file_urls=[file_url],
+        language_hints=language_hints,
+        disfluency_removal_enabled=disfluency,
+        timestamp_alignment_enabled=timestamp_align,
+    )
+
+    # 等待任务完成
+    print("  ⏳ 等待识别结果（耗时取决于音频长度）...")
+    transcribe_response = Transcription.wait(task=task_response.output.task_id)
+
+    if transcribe_response.status_code != HTTPStatus.OK:
+        raise RuntimeError(f"百炼识别任务失败: {transcribe_response.message}")
+
+    task_status = transcribe_response.output.get("task_status")
+    results = transcribe_response.output.get("results") or []
+    if task_status != "SUCCEEDED" or not results:
+        detail = results[0] if results else {}
+        raise RuntimeError(
+            f"百炼识别任务未成功: task_status={task_status}, "
+            f"code={detail.get('code', 'N/A')}, message={detail.get('message', 'N/A')}"
+        )
+
+    subtask_status = results[0].get("subtask_status")
+    if subtask_status != "SUCCEEDED":
+        raise RuntimeError(
+            f"百炼识别子任务未成功: subtask_status={subtask_status}, "
+            f"code={results[0].get('code', 'N/A')}, message={results[0].get('message', 'N/A')}"
+        )
+
+    # 下载识别结果
+    result_url = results[0].get("transcription_url")
+    if not result_url:
+        raise RuntimeError("百炼识别结果中没有 transcription_url")
+
+    result_resp = requests.get(result_url, timeout=(30, 300))
+    result_resp.raise_for_status()
+    result_payload = result_resp.json()
+
+    # 解析为统一格式
+    transcripts = result_payload.get("transcripts", [])
+    segments = []
+    text_parts = []
+    for transcript in transcripts:
+        for sentence in transcript.get("sentences", []):
+            text = sentence.get("text", "").strip()
+            if not text:
+                continue
+            begin_ms = int(sentence.get("begin_time", 0))
+            end_ms = int(sentence.get("end_time", 0))
+            segments.append({
+                "start": begin_ms / 1000.0,
+                "end": end_ms / 1000.0,
+                "text": text,
+            })
+            text_parts.append(text)
+
+    full_text = "\n".join(text_parts)
+    duration = segments[-1]["end"] if segments else (episode.get("duration_seconds", 0) if episode else 0)
+
+    elapsed = time.time() - start_time
+    print(f"  ✅ 转录完成，耗时 {elapsed:.0f}秒，共 {len(full_text)} 字，{len(segments)} 个分段")
+
+    return {"text": full_text, "segments": segments, "duration": duration}
+
+
+# ─────────────────────────────────────────
+# 本地转录（faster-whisper 优先，openai-whisper 兜底）
+# ─────────────────────────────────────────
+
+def _build_prompt(episode: dict) -> str:
     """
-    从播客元数据中提取热词列表（人名、公司名、术语等）。
-    返回 [{"text": "xxx", "weight": 4, "lang": "zh"}, ...]
+    用播客元数据构造 initial prompt，帮助模型识别节目名、嘉宾、专业术语。
     """
-    import re
-    hotwords = []
+    if not episode:
+        return ""
 
-    title = episode.get("title", "")
-    description = episode.get("description", "")
-    podcast_name = episode.get("podcast_name", "")
+    podcast_name = episode.get("podcast_name", "").strip()
+    title = episode.get("title", "").strip()
+    description = episode.get("description", "").strip()
 
-    # 1. 从标题提取人名（常见模式）
-    name_patterns = [
-        r'[与和]([^，。、｜\s聊对话探讨谈论]{2,6})(?:聊|对话|探讨|谈|论)',
-        r'对话\s*[:：]?\s*([^，。、｜\s]{2,6})',
-        r'嘉宾\s*[:：]?\s*([^，。、｜\s]{2,6})',
-        r'专访\s*([^，。、｜\s]{2,6})',
-    ]
-    for pat in name_patterns:
-        for name in re.findall(pat, title):
-            if 2 <= len(name) <= 15 and name not in hotwords:
-                hotwords.append(name)
-
-    # 2. 从节目简介中提取可能的人名/术语
+    parts = []
+    if podcast_name:
+        parts.append(f"播客：《{podcast_name}》")
+    if title:
+        parts.append(f"单集标题：《{title}》")
     if description:
-        # 匹配「嘉宾：XXX」「本期嘉宾XXX」等
-        desc_patterns = [
-            r'(?:嘉宾|主持人|主讲人)[：:\s]+([^，。、\n]{2,10})',
-        ]
-        for pat in desc_patterns:
-            for name in re.findall(pat, description):
-                name = name.strip()
-                if 2 <= len(name) <= 15 and name not in hotwords:
-                    hotwords.append(name)
+        # 简介可能很长，截断到 300 字
+        desc = re.sub(r"\s+", " ", description)[:300]
+        parts.append(f"简介：{desc}")
 
-    # 3. 节目名本身（如果看起来像人名）
-    # 纯中文 2-6 字可能是人名节目，排除含"的""播客""电台"等后缀的
-    if re.fullmatch(r'[\u4e00-\u9fff]{2,6}', podcast_name):
-        suffix_blacklist = ("的", "播客", "电台", "节目", "频道", "时间", "空间")
-        if not any(podcast_name.endswith(s) for s in suffix_blacklist):
-            hotwords.insert(0, podcast_name)
+    if not parts:
+        return ""
 
-    # 去重，构建热词列表
-    seen = set()
+    return "\n".join(parts)
+
+
+SENTENCE_END_PUNCT = "。！？!?…～；;"
+
+
+def merge_segments_to_sentences(segments: list, min_len: int = 20, max_len: int = 150) -> list:
+    """
+    将 ASR 细粒度分段合并为句级分段（对标百炼 Paraformer 的按句输出）。
+    把所有文本拼成字符序列（记录每字符所属分段），在满足 min_len 的
+    首个句末标点处切句；无标点的超长片段按 max_len 强制切分。
+    句子时间戳取首/尾字符所属分段的起止时间。
+    """
+    chars = []
+    seg_ids = []
+    for idx, seg in enumerate(segments):
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        for ch in text:
+            chars.append(ch)
+            seg_ids.append(idx)
+    if not chars:
+        return []
+
+    full = "".join(chars)
+    n = len(full)
+    merged = []
+    lo = 0
+    while lo < n:
+        cut = -1
+        limit = min(lo + max_len, n)
+        for i in range(lo + min_len - 1, limit):
+            if full[i] in SENTENCE_END_PUNCT:
+                cut = i + 1
+                break
+        if cut < 0:
+            cut = limit  # 无标点长片段：强制截断
+
+        sentence = full[lo:cut].strip()
+        if sentence:
+            s0 = segments[seg_ids[lo]].get("start", 0)
+            e0 = segments[seg_ids[cut - 1]].get("end", s0)
+            merged.append({"start": s0, "end": e0, "text": sentence})
+        lo = cut
+    return merged
+
+
+# ── 标点恢复（ct-punc）──────────────────
+# faster-whisper 中文输出不含任何标点，导致无法按句断句。
+# 用 FunASR 的 ct-punc（CT-Transformer）对标点做恢复，再按字符对齐写回分段。
+
+_PUNC_MODEL = None
+_PUNC_FAILED = False
+
+
+def _clean_restored_text(text: str) -> str:
+    """修复 ct-punc 输出的常见残留：重复标点、英文首字母重复、中文语境的 ASCII 标点。"""
+    # 1) 连续重复标点合并为一个（如 "，：" → "："，取最后一个）
+    text = re.sub(r"[，,。.、！!？?；;：:…～~]{2,}", lambda m: m.group(0)[-1], text)
+    # 2) 模型偶发的英文首字母重复："S SpaceX" → "SpaceX"
+    text = re.sub(r"(?<![A-Za-z])([A-Za-z]) (?=\1)", "", text)
+    # 3) 中文语境下 ASCII 标点转全角（先保护数字小数点 3.5）
+    _MAP = {",": "，", ".": "。", "!": "！", "?": "？", ";": "；", ":": "："}
+    text = re.sub(r"(\d)\.", lambda m: m.group(1) + "\u0001", text)
+    text = re.sub(r"[,.!?;:]\s*(?=[\u4e00-\u9fff])", lambda m: _MAP[m.group(0)[0]], text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])[,!?;:]", lambda m: _MAP[m.group(0)], text)
+    text = text.replace("\u0001", ".")
+    return text
+
+
+def _get_punc_model(model_name: str = "ct-punc"):
+    """懒加载全局标点恢复模型（只加载一次）"""
+    global _PUNC_MODEL
+    if _PUNC_MODEL is None:
+        from funasr import AutoModel
+        print(f"  ⏳ 加载标点恢复模型（{model_name}）...")
+        _PUNC_MODEL = AutoModel(model=model_name)
+        print(f"  ✅ 标点模型加载完成")
+    return _PUNC_MODEL
+
+
+def _align_punct_to_segments(raw: str, out: str, seg_count: int, bounds: list) -> list:
+    """
+    将标点恢复结果 out 对齐回各分段（difflib 求编辑对齐）。
+    bounds: 每个分段在 raw 中的 [start, end) 字符区间。
+    - equal: 逐字符归属对应分段
+    - insert: 插入的标点归属前一个 raw 字符所在分段；纯空白插入直接丢弃
+      （ct-punc 会在英文单词内插空格，如 "Jeff" → "J eff"）
+    - replace: 归属被替换 raw 范围起始的分段
+    - delete: 保留 raw 原文，防止丢字
+    """
+    import difflib
+
+    aligned = [""] * seg_count
+
+    def seg_of(ri: int) -> int:
+        if ri < 0:
+            return 0
+        if ri >= bounds[-1][1]:
+            return seg_count - 1
+        lo, hi = 0, seg_count - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if ri >= bounds[mid][1]:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    sm = difflib.SequenceMatcher(a=raw, b=out, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                aligned[seg_of(i1 + k)] += out[j1 + k]
+        elif tag == "insert":
+            added = out[j1:j2]
+            if added.strip() == "":
+                continue  # 丢弃 ct-punc 插入的空白
+            aligned[seg_of(i1 - 1)] += added
+        elif tag == "replace":
+            aligned[seg_of(i1)] += out[j1:j2]
+        else:  # delete
+            for k in range(i1, i2):
+                aligned[seg_of(k)] += raw[k]
+    return aligned
+
+
+def restore_punctuation(segments: list, config: dict) -> list:
+    """
+    对 ASR 细粒度分段做标点恢复（ct-punc），返回带标点的新分段列表。
+    文本分块送模型（避免超长输入），标点按字符对齐写回原分段时间戳。
+    """
+    global _PUNC_FAILED
+    if _PUNC_FAILED or not segments:
+        return segments
+
+    asr_cfg = config.get("asr", {})
+    model_name = asr_cfg.get("punc_model", "ct-punc")
+    chunk_size = int(asr_cfg.get("punc_chunk_size", 800) or 800)
+
+    try:
+        punc = _get_punc_model(model_name)
+    except Exception as e:
+        print(f"  ⚠️  标点模型加载失败，跳过标点恢复: {e}")
+        _PUNC_FAILED = True
+        return segments
+
     result = []
-    for word in hotwords:
-        clean = word.strip()
-        if clean and clean not in seen and len(clean) <= 15:
-            seen.add(clean)
-            result.append({"text": clean, "weight": 4, "lang": "zh"})
+    i = 0
+    t0 = time.time()
+    n = len(segments)
+    while i < n:
+        # 累积若干分段为一个 chunk（首个分段必收，之后累计超过 chunk_size 即止）
+        chunk = []
+        total = 0
+        while i < n and (total == 0 or total < chunk_size):
+            chunk.append(segments[i])
+            total += len(segments[i]["text"])
+            i += 1
 
+        raw = "".join(s["text"] for s in chunk)
+        res = punc.generate(input=raw)
+        out = (res[0].get("text", "") if res else "") or raw
+
+        bounds, pos = [], 0
+        for s in chunk:
+            bounds.append((pos, pos + len(s["text"])))
+            pos += len(s["text"])
+
+        aligned = _align_punct_to_segments(raw, out, len(chunk), bounds)
+        for s, text in zip(chunk, aligned):
+            text = _clean_restored_text(text).strip()
+            if text:
+                result.append({"start": s["start"], "end": s["end"], "text": text})
+
+    print(f"  ✍️  标点恢复完成，耗时 {time.time()-t0:.0f}s（{model_name}）")
     return result
 
 
-def _create_vocabulary(api_key: str, hotwords: list) -> str:
-    """
-    创建热词表，返回 vocabulary_id。
-    热词免费，每账号最多 10 个（使用后会删除）。
-    """
-    if not hotwords:
-        return ""
-
-    customize_url = f"{DASHSCOPE_BASE}/services/audio/asr/customization"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": HOTWORD_MODEL,
-        "input": {
-            "action": "create_vocabulary",
-            "target_model": FILETRANS_MODEL,
-            "prefix": HOTWORD_PREFIX,
-            "vocabulary": hotwords,
-        },
-    }
-
-    session = _get_session()
-    resp = session.post(customize_url, headers=headers, json=payload, timeout=30)
-
-    if resp.status_code != 200:
-        raise RuntimeError(f"创建热词表失败: {resp.status_code} {resp.text[:300]}")
-
-    data = resp.json()
-    vocab_id = data.get("output", {}).get("vocabulary_id", "")
-    if not vocab_id:
-        raise RuntimeError(f"热词表响应缺少 vocabulary_id: {resp.text[:300]}")
-
-    print(f"  🔤 热词表已创建（{len(hotwords)} 个词）: {vocab_id[:20]}...")
-    return vocab_id
-
-
-def _delete_vocabulary(api_key: str, vocabulary_id: str):
-    """删除热词表，释放配额"""
-    if not vocabulary_id:
-        return
-
-    customize_url = f"{DASHSCOPE_BASE}/services/audio/asr/customization"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": HOTWORD_MODEL,
-        "input": {
-            "action": "delete_vocabulary",
-            "vocabulary_id": vocabulary_id,
-        },
-    }
-
-    try:
-        session = _get_session()
-        resp = session.post(customize_url, headers=headers, json=payload, timeout=30)
-        if resp.status_code == 200:
-            print(f"  🗑️  热词表已删除: {vocabulary_id[:20]}...")
-        else:
-            print(f"  ⚠️  删除热词表失败: {resp.status_code} {resp.text[:100]}")
-    except Exception as e:
-        print(f"  ⚠️  删除热词表异常: {e}")
-
-
-def _list_vocabulary_ids(api_key: str) -> list:
-    """列出当前所有热词表 ID（用于清理残留）"""
-    customize_url = f"{DASHSCOPE_BASE}/services/audio/asr/customization"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": HOTWORD_MODEL,
-        "input": {
-            "action": "list_vocabulary",
-            "prefix": HOTWORD_PREFIX,
-            "page_index": 0,
-            "page_size": 10,
-        },
-    }
-
-    try:
-        session = _get_session()
-        resp = session.post(customize_url, headers=headers, json=payload, timeout=30)
-        if resp.status_code == 200:
-            data = resp.json()
-            vocabularies = data.get("output", {}).get("vocabularies", [])
-            return [v.get("vocabulary_id", "") for v in vocabularies if v.get("vocabulary_id")]
-    except Exception as e:
-        print(f"  ⚠️  查询热词表列表失败: {e}")
-
-    return []
-
-
-def _cleanup_stale_vocabularies(api_key: str):
-    """清理残留的热词表（避免占满 10 个配额）"""
-    vocab_ids = _list_vocabulary_ids(api_key)
-    if not vocab_ids:
-        return
-
-    print(f"  🧹 发现 {len(vocab_ids)} 个残留热词表，正在清理...")
-    for vid in vocab_ids:
-        _delete_vocabulary(api_key, vid)
-
-
-# ─────────────────────────────────────────
-# 百炼异步文件转录
-# ─────────────────────────────────────────
-
-def _upload_file_curl(audio_path: Path, api_key: str) -> str:
-    """使用 curl 上传音频文件到百炼（绕过 Python SSL 代理问题）
-    正确端点: POST /api/v1/files，字段名: files（非 file）
-    """
-    upload_url = "https://dashscope.aliyuncs.com/api/v1/files"
-
-    result = subprocess.run(
-        [
-            "curl", "--noproxy", "*",
-            "-s", "-w", "\nHTTP_CODE:%{http_code}",
-            "-X", "POST", upload_url,
-            "-H", f"Authorization: Bearer {api_key}",
-            "-F", f"files=@{audio_path};type=audio/mp4",
-            "-F", "purpose=file-extract",
-            "--max-time", "600",
-        ],
-        capture_output=True, timeout=900,
-    )
-
-    output = result.stdout.decode("utf-8", errors="replace")
-    lines = output.strip().split("\n")
-
-    http_code = ""
-    json_body = ""
-    for line in lines:
-        if line.startswith("HTTP_CODE:"):
-            http_code = line.split(":")[1]
-        else:
-            json_body += line
-
-    if not http_code or http_code != "200":
-        raise RuntimeError(f"curl 上传失败，HTTP {http_code}: {json_body[:300]}")
-
-    data = json.loads(json_body)
-    uploaded_files = data.get("data", {}).get("uploaded_files", [])
-    if not uploaded_files:
-        raise RuntimeError(f"上传响应中无成功文件: {json_body[:300]}")
-
-    file_id = uploaded_files[0].get("file_id", "")
-    if not file_id:
-        raise RuntimeError(f"上传响应中缺少 file_id: {json_body[:300]}")
-
-    print(f"  ✅ 上传成功（curl），file_id: {file_id[:16]}...")
-
-    # 获取文件 URL
-    print(f"  📥 获取文件 URL...")
-    detail_url = f"https://dashscope.aliyuncs.com/api/v1/files/{file_id}"
-    detail_result = subprocess.run(
-        ["curl", "--noproxy", "*", "-s", "-w", "\nHTTP_CODE:%{http_code}",
-         detail_url, "-H", f"Authorization: Bearer {api_key}"],
-        capture_output=True, timeout=30,
-    )
-    detail_output = detail_result.stdout.decode("utf-8", errors="replace")
-    detail_lines = detail_output.strip().split("\n")
-    detail_json = ""
-    for line in detail_lines:
-        if not line.startswith("HTTP_CODE:"):
-            detail_json += line
-
-    detail_data = json.loads(detail_json)
-    file_url = detail_data.get("data", {}).get("url", "")
-    if not file_url:
-        raise RuntimeError(f"文件详情中缺少 url: {detail_json[:300]}")
-
-    print(f"  ✅ 获取文件 URL 成功: {file_url[:60]}...")
-    return file_url
-
-
-def _upload_file_requests(audio_path: Path, api_key: str) -> str:
-    """使用 Python requests 上传音频文件（备选方案）"""
-    upload_url = f"{DASHSCOPE_BASE}/files"
-    upload_headers = {"Authorization": f"Bearer {api_key}"}
-
-    session = _get_session()
-    with open(audio_path, "rb") as f:
-        upload_resp = session.post(
-            upload_url,
-            headers=upload_headers,
-            files={"files": (audio_path.name, f)},
-            data={"purpose": "file-extract"},
-            timeout=(30, 1800),
-        )
-
-    if upload_resp.status_code != 200:
-        raise RuntimeError(f"文件上传失败: {upload_resp.status_code} {upload_resp.text[:300]}")
-
-    upload_data = upload_resp.json()
-    uploaded_files = upload_data.get("data", {}).get("uploaded_files", [])
-    if not uploaded_files:
-        raise RuntimeError(f"上传响应中无成功文件: {upload_resp.text[:300]}")
-
-    file_id = uploaded_files[0].get("file_id", "")
-    if not file_id:
-        raise RuntimeError(f"上传响应中缺少 file_id: {upload_resp.text[:300]}")
-
-    print(f"  ✅ 上传成功（requests），file_id: {file_id[:16]}...")
-
-    # 获取文件 URL
-    print(f"  📥 获取文件 URL...")
-    detail_resp = session.get(
-        f"{DASHSCOPE_BASE}/files/{file_id}",
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=30,
-    )
-
-    if detail_resp.status_code != 200:
-        raise RuntimeError(f"获取文件详情失败: {detail_resp.status_code} {detail_resp.text[:300]}")
-
-    detail_data = detail_resp.json()
-    file_url = detail_data.get("data", {}).get("url", "")
-    if not file_url:
-        raise RuntimeError(f"文件详情中缺少 url: {detail_resp.text[:300]}")
-
-    print(f"  ✅ 获取文件 URL 成功: {file_url[:60]}...")
-    return file_url
-
-
-def _upload_file(audio_path: Path, api_key: str) -> str:
-    """上传音频文件到百炼 OSS（优先 curl，回退 requests）"""
-    # 优先用 curl（已验证能绕过代理 SSL 问题）
-    try:
-        return _upload_file_curl(audio_path, api_key)
-    except FileNotFoundError:
-        print(f"  ⚠️  curl 不可用，回退到 Python requests...")
-    except Exception as e:
-        print(f"  ⚠️  curl 上传失败: {e}，回退到 Python requests...")
-
-    return _upload_file_requests(audio_path, api_key)
-
-
-def _submit_task(file_url: str, api_key: str, vocabulary_id: str = None) -> str:
-    """提交异步转录任务（Fun-ASR），返回 task_id"""
-    task_url = f"{DASHSCOPE_BASE}/services/audio/asr/transcription"
-    task_headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "X-DashScope-Async": "enable",
-    }
-
-    task_input = {"file_urls": [file_url]}
-    if vocabulary_id:
-        task_input["vocabulary_id"] = vocabulary_id
-
-    task_payload = {
-        "model": FILETRANS_MODEL,
-        "input": task_input,
-        "parameters": {"channel_id": [0], "language_hints": ["zh"]},
-    }
-
-    session = _get_session()
-    task_resp = session.post(task_url, headers=task_headers, json=task_payload, timeout=30)
-
-    if task_resp.status_code != 200:
-        raise RuntimeError(f"提交转录任务失败: {task_resp.status_code} {task_resp.text[:300]}")
-
-    task_data = task_resp.json()
-    task_id = task_data.get("output", {}).get("task_id", "")
-    if not task_id:
-        raise RuntimeError(f"提交响应中缺少 task_id: {task_resp.text[:300]}")
-
-    print(f"  ✅ 转录任务已提交，task_id: {task_id[:16]}...")
-    return task_id
-
-
-def _poll_result(task_id: str, api_key: str, max_wait: int = 1800) -> dict:
-    """轮询转录任务状态，返回转录结果 JSON"""
-    poll_interval = 5
-    elapsed = 0
-    session = _get_session()
-
-    while elapsed < max_wait:
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-
-        status_url = f"{DASHSCOPE_BASE}/tasks/{task_id}"
-        status_resp = session.get(
-            status_url,
-            headers={"Authorization": f"Bearer {api_key}", "X-DashScope-Async": "enable"},
-            timeout=30,
-        )
-
-        status_data = status_resp.json()
-        task_status = status_data.get("output", {}).get("task_status", "")
-
-        if task_status == "SUCCEEDED":
-            print(f"  ✅ 转录完成（总耗时 {elapsed}秒）")
-            return status_data
-
-        elif task_status == "FAILED":
-            error_msg = status_data.get("output", {}).get("message", "未知错误")
-            code = status_data.get("output", {}).get("code", "")
-            raise RuntimeError(f"转录任务失败 [{code}]: {error_msg}")
-
-        else:
-            # PENDING / RUNNING
-            print(f"\r  ⏳ 转录中... ({elapsed}秒, 状态: {task_status})", end="")
-
-    raise RuntimeError(f"转录超时（{max_wait}秒）")
-
-
-def _parse_transcription_result(result_data: dict) -> dict:
-    """解析转录结果，返回 {text, segments, duration}"""
-    import os
-    # 确保无代理
-    old_env = _clear_proxy_env()
-
-    try:
-        output = result_data.get("output", {})
-
-        # 策略1: 从 transcription_url 下载详细结果（带时间戳分段）
-        # 兼容两种响应格式：
-        #   - Fun-ASR:      output.results[].transcription_url（复数数组）
-        #   - 旧模型(qwen):  output.result.transcription_url（单数 dict）
-        transcription_url = ""
-
-        # 先尝试 Fun-ASR 格式：output.results（复数数组）
-        results_list = output.get("results")
-        if isinstance(results_list, list) and results_list:
-            for r in results_list:
-                if r.get("subtask_status") == "SUCCEEDED" and r.get("transcription_url"):
-                    transcription_url = r["transcription_url"]
-                    break
-
-        # 再尝试旧模型格式：output.result（单数 dict）
-        if not transcription_url:
-            result = output.get("result", {})
-            transcription_url = result.get("transcription_url", "")
-
-        if transcription_url:
-            print(f"  📥 下载转录详情...")
-            session = _get_session()
-            tr_resp = session.get(transcription_url, timeout=120)
-            tr_data = tr_resp.json()
-
-            text_parts = []
-            segments = []
-
-            # 解析嵌套结构：tr_data["transcripts"][0]["sentences"]
-            if isinstance(tr_data, dict):
-                # 处理嵌套 transcripts 结构
-                nested_transcripts = tr_data.get("transcripts", [])
-                if isinstance(nested_transcripts, list) and nested_transcripts:
-                    # 取第一个频道（通常是 channel_id=0）
-                    first_channel = nested_transcripts[0]
-                    if isinstance(first_channel, dict):
-                        # 优先使用 sentences 字段
-                        sentences = first_channel.get("sentences", [])
-                        if sentences:
-                            for sentence in sentences:
-                                text_parts.append(sentence.get("text", ""))
-                                segments.append({
-                                    "start": sentence.get("begin_time", 0) / 1000.0,
-                                    "end": sentence.get("end_time", 0) / 1000.0,
-                                    "text": sentence.get("text", ""),
-                                })
-                        # 如果 sentences 为空但 channel 有 text，作为纯文本回退
-                        elif first_channel.get("text"):
-                            text_parts.append(first_channel["text"])
-
-                # 如果嵌套 transcripts 没有产出 segments，尝试顶层字段
-                if not segments:
-                    sentences = (tr_data.get("sentences")
-                                 or tr_data.get("results")
-                                 or tr_data.get("transcription_results", []))
-                    if not sentences and "transcriptions" in tr_data:
-                        val = tr_data["transcriptions"]
-                        if isinstance(val, list) and val and isinstance(val[0], dict) and "sentences" in val[0]:
-                            sentences = val[0]["sentences"]
-                        elif isinstance(val, list):
-                            sentences = val
-                    if not sentences:
-                        for v in tr_data.values():
-                            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
-                                if "begin_time" in v[0] or "start" in v[0]:
-                                    sentences = v
-                                    break
-
-                    for sentence in sentences:
-                        text_parts.append(sentence.get("text", ""))
-                        segments.append({
-                            "start": sentence.get("begin_time", 0) / 1000.0,
-                            "end": sentence.get("end_time", 0) / 1000.0,
-                            "text": sentence.get("text", ""),
-                        })
-
-            elif isinstance(tr_data, list):
-                for item in tr_data:
-                    text_parts.append(item.get("text", ""))
-                    segments.append({
-                        "start": item.get("begin_time", 0) / 1000.0,
-                        "end": item.get("end_time", 0) / 1000.0,
-                        "text": item.get("text", ""),
-                    })
-
-            if segments:
-                full_text = "\n".join(text_parts) if text_parts else "\n".join(s["text"] for s in segments)
-                duration = segments[-1]["end"] if segments else 0
-                print(f"  ✅ 解析到 {len(segments)} 个时间戳分段，时长 {duration:.0f}s")
-                return {"text": full_text, "segments": segments, "duration": duration}
-
-            if text_parts:
-                full_text = "\n".join(text_parts)
-                print(f"  ⚠️  仅有纯文本，无时间戳分段（{len(full_text)} 字）")
-                return {"text": full_text, "segments": [], "duration": 0}
-
-            # transcription_url 有内容但无法解析
-            print(f"  ⚠️  transcription_url 数据无法解析，结构: {type(tr_data).__name__}")
-            if isinstance(tr_data, dict):
-                print(f"  ⚠️  keys: {list(tr_data.keys())[:10]}")
-            print(f"  ⚠️  内容预览: {str(tr_data)[:300]}")
-
-        # 策略2: 直接从 choices 字段提取文本
-        choices = output.get("choices", [])
-        if choices:
-            content = choices[0].get("message", {}).get("content", "")
-            if content:
-                return {"text": content, "segments": [], "duration": 0}
-
-        # 策略3: 检查 result 中的 text 字段
-        if result.get("text"):
-            return {"text": result["text"], "segments": [], "duration": 0}
-
-        # 策略4: 打印完整 output 帮助调试
-        print(f"  ⚠️  无法解析转录结果，output 结构: {list(output.keys())}")
-        print(f"  ⚠️  output 内容预览: {str(output)[:500]}")
-        return {"text": "", "segments": [], "duration": 0}
-    finally:
-        _restore_proxy_env(old_env)
-
-
-def transcribe_audio(audio_path: Path, config: dict, episode: dict = None) -> dict:
-    """
-    百炼异步文件转录（Fun-ASR + 热词增强）。
-    流程：清理残留热词 → 构建热词 → 上传 → 提交任务（含热词） → 轮询 → 解析结果 → 删除热词
-    """
-    t_cfg = config.get("transcription", {})
-    api_key = t_cfg.get("openai_api_key", "")
-
-    if not api_key or api_key == "sk-xxxx":
-        raise ValueError("请在 config.json 的 transcription.openai_api_key 中填入百炼 API Key")
+def _transcribe_faster_whisper(audio_path: Path, config: dict, episode: dict = None) -> dict:
+    """使用 faster-whisper（CTranslate2）本地转录：CPU int8 量化，速度快、精度高。"""
+    from faster_whisper import WhisperModel
+
+    asr_cfg = config.get("asr", {})
+    model_name = asr_cfg.get("model", "large-v3")
+    compute_type = asr_cfg.get("compute_type", "int8")
+    cpu_threads = int(asr_cfg.get("cpu_threads", 8) or 8)
+    language = asr_cfg.get("language", "zh")
+    vad_filter = bool(asr_cfg.get("vad_filter", True))
+    condition_on_previous_text = asr_cfg.get("condition_on_previous_text", True)
+    beam_size = int(asr_cfg.get("beam_size", 5) or 5)
 
     file_size = audio_path.stat().st_size
-    print(f"  🎙️  开始转录（Fun-ASR + 热词增强）: {audio_path.name} ({file_size/1024/1024:.1f}MB)")
+    print(f"  🎙️  开始本地转录（faster-whisper {model_name} / cpu-{compute_type}）: "
+          f"{audio_path.name} ({file_size/1024/1024:.1f}MB)")
     start_time = time.time()
 
-    # Step 0: 清理残留热词表（防配额耗尽）
-    _cleanup_stale_vocabularies(api_key)
+    print(f"  ⏳ 加载模型 {model_name}...")
+    model = WhisperModel(model_name, device="cpu", compute_type=compute_type,
+                         cpu_threads=cpu_threads)
 
-    # Step 1: 构建并创建热词表
-    vocabulary_id = ""
-    hotwords = _build_hotwords(episode or {})
-    if hotwords:
+    kwargs = {
+        "language": language,
+        "beam_size": beam_size,
+        "vad_filter": vad_filter,
+        "condition_on_previous_text": condition_on_previous_text,
+    }
+    prompt = _build_prompt(episode or {})
+    if prompt:
+        kwargs["initial_prompt"] = prompt
+        print(f"  📝 使用元数据 prompt 提升专有名词识别")
+
+    seg_gen, info = model.transcribe(str(audio_path), **kwargs)
+    print(f"  🌐 语言: {info.language} (p={info.language_probability:.2f})，"
+          f"音频时长 {info.duration:.0f}s")
+
+    segments = []
+    for seg in seg_gen:
+        text = (seg.text or "").strip()
+        if not text:
+            continue
+        segments.append({"start": float(seg.start), "end": float(seg.end), "text": text})
+
+    # faster-whisper 中文输出无标点，先用 ct-punc 恢复标点再做句级合并
+    if asr_cfg.get("punc_restore", True):
         try:
-            vocabulary_id = _create_vocabulary(api_key, hotwords)
+            segments = restore_punctuation(segments, config)
         except Exception as e:
-            print(f"  ⚠️  热词表创建失败，继续无热词转录: {e}")
+            print(f"  ⚠️  标点恢复失败，继续无标点流程: {e}")
+
+    if asr_cfg.get("sentence_merge", True):
+        before = len(segments)
+        segments = merge_segments_to_sentences(segments)
+        print(f"  🔗 句级合并: {before} 个细粒度分段 → {len(segments)} 个句级分段")
+
+    full_text = "\n".join(s["text"] for s in segments)
+    duration = segments[-1]["end"] if segments else (episode.get("duration_seconds", 0) if episode else 0)
+
+    elapsed = time.time() - start_time
+    print(f"  ✅ 转录完成，耗时 {elapsed:.0f}秒，共 {len(full_text)} 字，{len(segments)} 个分段")
+
+    return {"text": full_text, "segments": segments, "duration": duration}
+
+
+def _resolve_device(device_pref: str) -> str:
+    """根据配置和实际环境确定 whisper 运行设备"""
+    if device_pref and device_pref != "auto":
+        return device_pref
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def _transcribe_openai_whisper(audio_path: Path, config: dict, episode: dict = None) -> dict:
+    """旧版 openai-whisper 本地转录（faster-whisper 不可用时的兜底路径）。"""
+    import whisper
+
+    asr_cfg = config.get("asr", {})
+    model_name = asr_cfg.get("model", "small")
+    device = _resolve_device(asr_cfg.get("device", "auto"))
+    language = asr_cfg.get("language", "zh")
+    condition_on_previous_text = asr_cfg.get("condition_on_previous_text", True)
+    fp16 = asr_cfg.get("fp16", False) if device == "cpu" else asr_cfg.get("fp16", True)
+
+    file_size = audio_path.stat().st_size
+    print(f"  🎙️  开始本地转录（Whisper {model_name} / {device}）: {audio_path.name} ({file_size/1024/1024:.1f}MB)")
+    start_time = time.time()
+
+    print(f"  ⏳ 加载 Whisper 模型 {model_name}...")
+    model = whisper.load_model(model_name).to(device)
+
+    prompt = _build_prompt(episode or {})
+    if prompt:
+        print(f"  📝 使用元数据 prompt 提升专有名词识别")
+
+    kwargs = {
+        "language": language,
+        "condition_on_previous_text": condition_on_previous_text,
+        "fp16": fp16,
+        "verbose": False,
+    }
+    if prompt:
+        kwargs["initial_prompt"] = prompt
+
+    result = model.transcribe(str(audio_path), **kwargs)
+
+    segments = []
+    text_parts = []
+    for seg in result.get("segments", []):
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        segments.append({
+            "start": float(seg.get("start", 0)),
+            "end": float(seg.get("end", 0)),
+            "text": text,
+        })
+        text_parts.append(text)
+
+    if asr_cfg.get("sentence_merge", True):
+        segments = merge_segments_to_sentences(segments)
+
+    full_text = "\n".join(s["text"] for s in segments)
+    duration = segments[-1]["end"] if segments else (episode.get("duration_seconds", 0) if episode else 0)
+
+    elapsed = time.time() - start_time
+    print(f"  ✅ 转录完成，耗时 {elapsed:.0f}秒，共 {len(full_text)} 字，{len(segments)} 个分段")
+
+    return {"text": full_text, "segments": segments, "duration": duration}
+
+
+def transcribe_audio(audio_path: Path | str, config: dict, episode: dict = None) -> dict:
+    """
+    根据配置选择 ASR 后端转录音频。
+    返回 {"text": str, "segments": list, "duration": float}
+    """
+    audio_path = Path(audio_path)
+    backend = config.get("asr", {}).get("backend", "local").lower()
+    if backend == "bailian":
+        return _transcribe_bailian(audio_path, config, episode)
 
     try:
-        # Step 2: 上传（curl 优先）
-        print(f"  📤 上传音频文件到百炼...")
-        file_url = _upload_file(audio_path, api_key)
-
-        # Step 3: 提交任务（含热词）
-        print(f"  📋 提交异步转录任务...")
-        task_id = _submit_task(file_url, api_key, vocabulary_id)
-
-        # Step 4: 轮询
-        result_data = _poll_result(task_id, api_key, max_wait=1800)
-
-        # Step 5: 解析结果
-        transcript = _parse_transcription_result(result_data)
-
-        elapsed = time.time() - start_time
-        seg_count = len(transcript["segments"])
-        hotword_info = f"，热词 {len(hotwords)} 个" if hotwords else ""
-        print(f"  ✅ 转录完成，耗时 {elapsed:.0f}秒，共 {len(transcript['text'])} 字，{seg_count} 个分段{hotword_info}")
-
-        return transcript
-    finally:
-        # Step 6: 删除热词表（释放配额）
-        if vocabulary_id:
-            _delete_vocabulary(api_key, vocabulary_id)
+        import faster_whisper  # noqa: F401
+        return _transcribe_faster_whisper(audio_path, config, episode)
+    except ImportError:
+        print("  ⚠️  未安装 faster-whisper，回退到 openai-whisper")
+        return _transcribe_openai_whisper(audio_path, config, episode)
 
 
 # ─────────────────────────────────────────
@@ -719,7 +662,7 @@ def _get_transcript_cache_path(episode_id: str) -> Path:
     return TRANSCRIPT_CACHE / f"{episode_id}.json"
 
 
-def load_transcript_cache(episode: dict) -> Optional[dict]:
+def load_transcript_cache(episode: dict) -> dict | None:
     """
     尝试读取本地转录缓存。
     返回缓存 dict（含 transcript / transcript_segments / audio_duration），
@@ -741,7 +684,6 @@ def load_transcript_cache(episode: dict) -> Optional[dict]:
         transcript_text = data.get("transcript", "")
         segments = data.get("transcript_segments", [])
 
-        # 有效缓存：转录文本非空，或有足够多的分段
         if transcript_text or len(segments) > 5:
             print(f"  📋 找到本地转录缓存（{len(transcript_text)} 字，{len(segments)} 分段）")
             return data
@@ -799,37 +741,38 @@ def _cleanup_audio_cache(episode: dict):
 
 def download_and_transcribe(episode: dict, config: dict) -> dict:
     """
-    完整流程：下载 → 上传 → 转录 → 返回结果
+    完整流程：下载 → 本地转录 → 返回结果
     支持从本地缓存恢复（已含完整 transcript + segments）
     转录成功（含缓存命中）后自动删除音频文件释放磁盘空间。
     """
     try:
-        # Step 1: 下载音频
-        audio_path = download_audio(episode)
+        # Step 1: 下载音频（YouTube 等受限站点可能需要代理）
+        from podauth import get_proxy
+        proxy = get_proxy(config) if config else ""
+        audio_path = download_audio(episode, proxy=proxy)
         episode["audio_local_path"] = str(audio_path)
 
-        # Step 2: 检查本地转录缓存
-        cached = load_transcript_cache(episode)
+        # Step 2: 检查本地转录缓存（用户选择强制重转时跳过）
+        cached = None if episode.get("_force_retranscribe") else load_transcript_cache(episode)
         if cached:
             episode["transcript"] = cached.get("transcript", "")
             episode["transcript_segments"] = cached.get("transcript_segments", [])
             episode["audio_duration"] = cached.get("audio_duration", 0)
-            # audio_local_path 已在上面设置
-            episode["_from_cache"] = True  # 标记来源，供调用方判断
-            _cleanup_audio_cache(episode)  # 缓存命中，清理音频
+            episode["_from_cache"] = True
+            _cleanup_audio_cache(episode)
             return episode
 
-        # Step 3: 上传并转录（传入 episode 以构建热词）
+        # Step 3: 本地转录
         transcript = transcribe_audio(audio_path, config, episode)
 
         episode["transcript"] = transcript["text"]
         episode["transcript_segments"] = transcript["segments"]
         episode["audio_duration"] = transcript["duration"] or episode.get("duration_seconds", 0)
 
-        # Step 4: 保存转录缓存（供下次快速恢复，跳过重新转录）
+        # Step 4: 保存转录缓存
         save_transcript_cache(episode)
 
-        # Step 5: 清理音频缓存，释放磁盘空间
+        # Step 5: 清理音频缓存
         _cleanup_audio_cache(episode)
 
         return episode
@@ -838,5 +781,4 @@ def download_and_transcribe(episode: dict, config: dict) -> dict:
         episode["transcript"] = ""
         episode["transcript_segments"] = []
         episode["error"] = str(e)
-        # 异常时不清理音频（保留供重试）
         return episode

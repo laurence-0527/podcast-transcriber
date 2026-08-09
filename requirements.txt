@@ -1,3 +1,21 @@
 requests>=2.28.0
 reportlab>=4.0.0
 markdown>=3.4.0
+
+# ── 本地 ASR（默认后端 faster-whisper + ct-punc 标点恢复）──
+faster-whisper>=1.0.0
+# 注意：本机实测 ctranslate2 4.8.0 在 Windows/Anaconda 加载模型时段错误，需固定 4.6.0
+ctranslate2==4.6.0
+funasr>=1.2.0
+modelscope>=1.22.0
+# torchaudio 版本必须与已安装的 torch 严格一致（torch 2.7.0 → torchaudio 2.7.0）
+torchaudio>=2.7.0
+
+# 旧版 openai-whisper（可选兜底，仅当 faster-whisper 不可用时回退；默认注释）
+# openai-whisper>=20231117
+
+# 百炼 ASR 可选依赖（仅当 asr.backend=bailian 时需要）
+dashscope>=1.20.0
+
+# YouTube 可选依赖（仅当输入为 YouTube 链接时需要）
+yt-dlp>=2024.4.9

@@ -69,6 +69,7 @@ def _check_cache(episode: dict, config: dict) -> bool:
                 episode["_from_cache"] = True
             return True
         elif choice == "r":
+            episode["_force_retranscribe"] = True
             return False
         elif choice == "q":
             episode["_skip_quit"] = True
@@ -85,7 +86,9 @@ def process_url(url: str, config: dict, title: str = None, dry_run: bool = False
     # Step 1: 获取元数据
     print("\n📡 抓取单集信息...")
     try:
-        episode = fetch_episode(url)
+        from podauth import get_proxy
+        proxy = get_proxy(config) if config else ""
+        episode = fetch_episode(url, proxy=proxy)
     except Exception as e:
         print(f"  ❌ 获取信息失败: {e}")
         return {"url": url, "status": "fetch_failed", "error": str(e)}

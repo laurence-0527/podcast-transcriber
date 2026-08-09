@@ -1,15 +1,41 @@
 {
-  "_comment": "复制此文件为 config.json，填入你的百炼 API Key",
+  "_comment": "复制此文件为 config.json，按需调整。默认本地 faster-whisper + ct-punc，无需任何 API Key；百炼 ASR 与代理均为可选项。",
 
-  "transcription": {
-    "openai_api_key": "sk-xxxx",
-    "openai_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "_note": "阿里云百炼异步文件转录（语音转文字）"
+  "asr": {
+    "backend": "local",
+    "model": "large-v3",
+    "compute_type": "int8",
+    "cpu_threads": 8,
+    "beam_size": 1,
+    "vad_filter": true,
+    "sentence_merge": true,
+    "punc_restore": true,
+    "punc_model": "ct-punc",
+    "punc_chunk_size": 800,
+    "device": "auto",
+    "language": "zh",
+    "condition_on_previous_text": true,
+    "fp16": false,
+    "_note": "backend 可选 local(faster-whisper 优先，未安装时回退 openai-whisper) 或 bailian(百炼/DashScope)；model 支持 HuggingFace 模型名（首次自动下载）或本地 CTranslate2 模型目录路径（如 C:/Users/you/models/faster-whisper-large-v3）；compute_type 纯 CPU 建议 int8；cpu_threads 按物理核心数调整；beam_size=1 中文质量与 5 几乎无差且快 35%；punc_restore 用 FunASR ct-punc 恢复标点（faster-whisper 中文输出无标点，首次自动从 ModelScope 下载约 1GB）；sentence_merge 按句末标点合并为句级分段"
+  },
+
+  "bailian": {
+    "api_key": "",
+    "model": "paraformer-v2",
+    "base_url": "",
+    "language_hints": ["zh", "en"],
+    "disfluency_removal_enabled": false,
+    "timestamp_alignment_enabled": true,
+    "_note": "仅当 asr.backend=bailian 时生效；api_key 支持从环境变量 DASHSCOPE_API_KEY 读取"
+  },
+
+  "network": {
+    "proxy": "",
+    "_note": "HTTP 代理，如 http://127.0.0.1:7897；访问 YouTube 等受限站点时需要，留空则不使用（也支持环境变量 HTTPS_PROXY）；代理失效时下载自动回退直连"
   },
 
   "output": {
-    "dir": "output"
-  },
-
-  "_env_note": "推荐设置环境变量 DASHSCOPE_API_KEY，优先级高于此文件中的 api_key"
+    "dir": "output",
+    "_note": "输出目录，可为相对路径（相对本工具目录）或绝对路径"
+  }
 }
