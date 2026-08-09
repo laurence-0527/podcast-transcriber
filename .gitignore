@@ -18,3 +18,8 @@ recycled/
 # ─── 系统文件 ───
 .DS_Store
 Thumbs.db
+
+# ─── Agent 工具产物 ───
+.agents/
+.claude/
+skills-lock.json
