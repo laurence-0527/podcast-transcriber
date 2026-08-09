@@ -28,27 +28,115 @@
 - **プラットフォーム非依存**：JSON-LD / OpenGraph / HTML5 audio / 直接音声URL — 特定プラットフォームに縛られない
 - **タイムスタンプ付き逐字テキスト**：全発言に正確な時間を付与、原文へのジャンプが容易
 - **ローカルキャッシュ**：音声と文字起こし結果をローカルにキャッシュ、同一エピソードの再処理はダウンロード不要
-- **LLM依存なし**：ツール自体は大規模言語モデルAPIを呼び出さない（ASRを除く）、要約はユーザーが行う
+- **デフォルトで完全ローカル実行**：faster-whisper（Whisper large-v3、CPU int8）認識 + FunASR ct-punc 句読点復元により、百煉 Paraformer と同等の**文単位・句読点付きセグメント**を出力。クラウドAPI Keyは一切不要、音声はマシンの外に出ない
+- **オプションで百煉（Bailian）ASR**：`asr.backend: bailian` に切り替えると DashScope Paraformer を利用可能。高速化や低スペック環境に適する（下記「ローカル vs クラウド：選び方」参照）
+- **YouTube リンク対応**：YouTube の動画URLを直接渡すと、yt-dlp で音声ストリームを解決して文字起こし（`pip install yt-dlp` が必要）
+- **プロキシ対応**：`network.proxy`（または環境変数 `HTTPS_PROXY`）で HTTP プロキシを設定可能。YouTube などアクセス制限のあるサイトに必要。プロキシ不可時は自動で直接接続にフォールバック
 
 ## クイックスタート
 
 ### 1. 依存関係のインストール
 
 ```bash
-pip install requests reportlab markdown
+pip install -r requirements.txt
 ```
 
-### 2. API Key の設定
+CPU で実行する場合、容量とダウンロード時間を節約するため CPU 版 PyTorch を推奨します：
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+### 2. ローカル文字起こしのマシン要件と所要時間の目安
+
+デフォルトのローカル構成 = **faster-whisper（Whisper large-v3、CPU int8量子化）認識 + FunASR ct-punc 句読点復元**。文単位・句読点付きセグメントを、完全オフラインで出力します。
+
+**初回実行時に2つのモデルが自動ダウンロードされます**（以降はキャッシュを再利用）：
+
+| モデル | 用途 | サイズ | ダロード元 |
+|------|------|------|--------|
+| Whisper large-v3（CTranslate2形式） | 音声認識 | ~3.1GB | HuggingFace または ModelScope |
+| ct-punc（CT-Transformer） | 句読点復元 | ~1.05GB | ModelScope（自動） |
+
+**ハードウェア要件（GPU不要、純CPUで動作）**：
+
+| 構成ランク | CPU | メモリ | 目安 |
+|--------|-----|------|--------|
+| 最低 | 4コア x86-64（2018年以降） | 8GB | 動作可能、所要時間は音声の約6〜8倍 |
+| 推奨 | 8コア以上（例：i5-1240P / R7-5800U / M1 以上） | 16GB | 所要時間は音声の約3〜3.5倍 |
+| 余裕 | 12コア以上の高クロック / Apple Silicon | 16GB以上 | 所要時間は音声の約2〜3倍 |
+
+> メモリ使用量のピークは約4〜5GB（認識モデル約3GB + 句読点モデル約1.5GB）。メモリ8GB未満の場合は百煉クラウドASRの利用を検討してください。
+
+**所要時間の計算式**：`文字起こし時間 ≈ 音声の長さ × リアルタイム倍率 + モデル読込約30秒`。
+
+実測参考（i5-1240P / 8スレッド / int8）：5分の番組で約15〜18分、1時間の番組で約3〜3.5時間。句読点復元は高速（約150字/秒）で、全体に占める割合はごくわずかです。
+
+> ヒント：`cpu_threads`（デフォルト8）はCPUの物理コア数に合わせて調整可能；`beam_size` はデフォルト1（中国語ではbeam=5と品質がほぼ同等で、速度は約35%高速）。詳細は `config/config.example.json` の `asr` セクションのコメントを参照。
+
+### 3. 百煉 ASR（オプション）
+
+ローカル CPU が遅すぎる場合や、より高速に文字起こしを行いたい場合は、百煉（DashScope）Paraformer に切り替えられます：
 
 ```bash
 cp config/config.example.json config/config.json
-# config.json を編集して DashScope API Key を入力、または環境変数を設定
-export DASHSCOPE_API_KEY=sk-your-key-here
 ```
 
-API Key の取得：[Alibaba Cloud DashScope コンソール](https://dashscope.console.aliyun.com/apiKey)
+`config.json` を編集：
 
-### 3. 文字起こし
+```json
+{
+  "asr": {
+    "backend": "bailian"
+  },
+  "bailian": {
+    "api_key": "あなたの百煉 API Key",
+    "model": "paraformer-v2"
+  }
+}
+```
+
+`api_key` は環境変数 `DASHSCOPE_API_KEY` からも読み込めます。設定ファイルへの書き込みを避けたい場合に便利です。
+
+### ローカル vs クラウド：選び方
+
+どちらのバックエンドも出力形式は完全に同じ（文単位セグメント + タイムスタンプ + Markdown/PDF）で、いつでも切り替え可能です。お使いのマシンに合わせて選んでください：
+
+| 観点 | ローカル（faster-whisper + ct-punc） | クラウド（百煉 Paraformer） |
+|------|----------------------------------|------------------------|
+| 速度 | 音声の約2〜8倍（CPU次第） | 音声の約0.1〜0.2倍、1時間の番組でも数分 |
+| 費用 | 無料 | 従量課金（無料枠あり） |
+| プライバシー | 音声はマシンの外に出ない | 音声をクラウドにアップロード |
+| ネットワーク | 初回のモデルダウンロード時のみ | 常時必要 |
+| 敷居 | 8GB以上メモリのCPU | 百煉 API Key の申請が必要 |
+| 品質 | large-v3 + 句読点復元、文単位セグメント | Paraformer-v2、文単位セグメント |
+
+**マシン構成別のおすすめ**：
+
+- **メモリ16GB以上・直近5年以内の8コア以上CPU** → ローカル文字起こし。品質はクラウドと同等、無料でプライバシーも安心。短い番組（20分未満）の待ち時間は十分許容範囲
+- **メモリ8〜16GB・4〜8コアCPU** → ローカル可だがやや遅い。短い番組はローカル、1時間以上の長い番組はクラウド推奨、またはローカルで一晩かけ放置
+- **メモリ8GB未満 / 古いCPU / すぐに結果が必要** → 百煉クラウドASR
+- **内容が機微でアップロード不可** → ローカル一択。マシン性能が不足する場合は、より高性能なマシンでの実行を検討
+
+> ハイブリッド運用も一般的です：日々の短い番組はローカルで処理し、溜まった長い番組は `backend: bailian` に切り替えて一括高速処理。
+
+### 4. ネットワークプロキシ（オプション）
+
+YouTube など直接アクセスできないサイトがある場合は、HTTP プロキシを設定できます。メタデータ取得と音声ダウンロード時に使用され、プロキシ不可時は自動的に直接接続へフォールバックします。
+
+`config.json` を編集：
+
+```json
+{
+  "network": {
+    "proxy": "http://127.0.0.1:7897"
+  }
+}
+```
+
+環境変数 `HTTPS_PROXY` / `HTTP_PROXY` にも対応します（設定ファイルが優先）。
+
+### 5. 文字起こし
 
 ```bash
 # ポッドキャストのWebページから自動取得
@@ -57,7 +145,10 @@ python main.py https://example.com/podcast/episode-42
 # 直接音声URL（タイトルを手動指定）
 python main.py https://cdn.example.com/audio/ep42.mp3 --title "AIの未来"
 
-# メタデータのみ取得（プレビュー用、API Key不要）
+# YouTube 動画（yt-dlp が必要；アクセス制限があれば network.proxy を設定）
+python main.py https://www.youtube.com/watch?v=VIDEO_ID
+
+# メタデータのみ取得（プレビュー用）
 python main.py --dry https://example.com/podcast/episode-42
 ```
 
@@ -96,12 +187,27 @@ _Podcast Transcriber により自動生成 · 個人の学習目的専用_
 ```text
 URL入力
   │
-  ├─ podfetch.py      → Webスクレイピング：JSON-LD / OpenGraph / HTML5 audio
-  ├─ podtranscribe.py → 音声ダウンロード → DashScope非同期ASR → タイムスタンプ分割
+  ├─ podfetch.py      → Webスクレイピング：JSON-LD / OpenGraph / HTML5 audio；YouTubeは yt-dlp 経由
+  ├─ podtranscribe.py → 音声ダウンロード（プロキシ任意）→ faster-whisper 認識 + ct-punc 句読点復元 → 文単位タイムスタンプセグメント
   ├─ podsummarize.py  → Markdownドキュメント組み立て
   └─ md2pdf.py        → Markdown → PDF（CJK対応）
   │
   └─ output/<日付_番組名_タイトル>/  ← MD + PDF
+```
+
+## プロジェクト構成
+
+```
+├── main.py               # CLI エントリポイント
+├── podfetch.py           # 汎用メタデータ取得
+├── podtranscribe.py      # 音声ダウンロード + ローカル faster-whisper 認識 + ct-punc 句読点復元
+├── podsummarize.py       # 文字起こしドキュメント構築 + 出力管理
+├── podauth.py            # ローカル設定読み込み
+├── md2pdf.py             # Markdown → PDF
+├── SKILL.md              # AI Agent スキル定義（エージェント呼び出し用）
+├── config/
+│   └── config.example.json
+└── output/               # 文字起こし成果物（gitignore対象）
 ```
 
 ## 対応ソース
@@ -112,20 +218,27 @@ URL入力
 - OpenGraph（`og:audio`）
 - HTML5 `<audio>` タグ
 - 直接音声URL（.mp3 / .m4a / .wav / .ogg / .aac / .flac / .opus）
+- YouTube 動画リンク（yt-dlp で音声ストリームを解決、オプション）
 
-動作確認済み：小宇宙（Xiaoyuzhou）、Apple Podcasts、Spotify（Web版）、TWiT、Libsynホスティング等。
+動作確認済み：小宇宙（Xiaoyuzhou）、Apple Podcasts、Spotify（Web版）、TWiT、Libsynホスティング、YouTube 等。
 
 ## AI Agent スキルとして使用
 
-本プロジェクトには `SKILL.md` が付属しており、エージェントスキルとして直接インストールできます。エージェントは本ツールで文字起こしを行い、自身のモデル能力で要約・トピック分割・推薦図書等を生成します——追加のLLM API設定は不要です。
+本プロジェクトには `SKILL.md` が付属しており、エージェントスキルとして直接インストールできます。エージェントは本ツールで文字起こしを行い、自身のモデル能力で要約・トピック分割・推薦図書等を生成します——外部 API 設定は一切不要です。
 
 ## よくある質問
 
 **Q: 1エピソードの処理時間は？**
-A: ダウンロード1〜3分 + 非同期ASR 5〜15分（音声の長さとサーバー負荷による）。1時間のポッドキャストで合計約10〜20分。
+A: ダウンロード1〜3分；ローカル文字起こしの所要時間は音声の約2〜8倍（CPU次第、8コア機種で約3〜3.5倍）、1時間のポッドキャストで約3〜4時間です。百煉クラウドに切り替えれば数分で完了します。詳細は上記「ローカル文字起こしのマシン要件と所要時間の目安」を参照。
 
 **Q: 対応言語は？**
-A: DashScope ASRは中国語・英語・日本語等多言語対応。
+A: Whisper large-v3 は中国語・英語・日本語等多言語対応。ct-punc 句読点復元は中国語・英語混在テキストに対応。中国語ポッドキャストでは `"language": "zh"` を推奨します。
+
+**Q: YouTube のポッドキャストも文字起こしできる？**
+A: 可能。YouTube のURLをそのまま渡してください（`pip install yt-dlp` が前提）。YouTube に接続できない場合は、`network.proxy` に利用可能なプロキシ（例：Clash の `http://127.0.0.1:7897`）を設定してください。
+
+**Q: PDF で日本語・中国語が文字化けする？**
+A: CJK フォントが必要です。Windows/macOS は通常標準搭載；Linux は `fonts-wqy-zenhei` をインストールしてください。
 
 **Q: 一括処理できる？**
 A: 可能。シンプルなシェルループで：
@@ -137,10 +250,8 @@ for url in $(cat urls.txt); do python main.py "$url"; done
 
 1. **メタデータ取得**：ポッドキャストWebページの公開HTMLからタイトル・音声URLを抽出（ローカル処理）
 2. **音声ダウンロード**：ポッドキャストCDNからローカル `audio_cache/` に保存
-3. **音声認識**：音声を **Alibaba Cloud DashScope** にアップロードし非同期認識
+3. **音声認識**：faster-whisper 認識 + ct-punc 句読点復元をすべてローカルで実行、音声はマシンの外に出ない（百煉バックエンド選択時はクラウドにアップロードされる）
 4. **ローカル出力**：Markdown + PDF を `output/` に保存
-
-ステップ3で音声データがAlibaba Cloudサーバーに送信されます。コンテンツを処理する権限があることをご確認ください。
 
 ## 免責事項
 

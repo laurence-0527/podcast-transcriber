@@ -28,27 +28,115 @@
 - **多源识别**：JSON-LD / OpenGraph / HTML5 audio / 直接音频 URL，不绑定特定平台
 - **带时间戳的逐字转录**：每句话标注精确时间，方便跳转收听原文
 - **缓存复用**：音频和转录结果本地缓存，重复处理同一集无需重新下载
-- **无 LLM 依赖**：工具本身不调用任何大模型 API（ASR 除外），摘要由你自行完成
+- **默认完全本地运行**：faster-whisper（Whisper large-v3，CPU int8）识别 + FunASR ct-punc 标点恢复，输出与百炼 Paraformer 相当的**句级带标点分段**，无需任何云端 API Key，音频不离开本机
+- **可选百炼 ASR**：配置 `asr.backend: bailian` 即可切换到 DashScope Paraformer，适合追求速度或本地算力不足的场景（见下文「本地转录 vs 云端转录」）
+- **支持 YouTube 链接**：直接传入 YouTube 视频 URL，自动解析音频流并转录（需 `pip install yt-dlp`）
+- **代理支持**：`network.proxy` 可配置 HTTP 代理（也支持环境变量 `HTTPS_PROXY`），用于访问 YouTube 等受限站点；代理失效时音频下载自动回退直连
 
 ## 快速开始
 
 ### 1. 安装依赖
 
 ```bash
-pip install requests reportlab markdown
+pip install -r requirements.txt
 ```
 
-### 2. 配置 API Key
+如果你使用 CPU 运行，建议安装 CPU 版 PyTorch 以节省空间和下载时间：
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+### 2. 本地转录的机器要求与耗时预估
+
+默认本地管线 = **faster-whisper（Whisper large-v3，CPU int8 量化）识别 + FunASR ct-punc 标点恢复**，输出句级带标点分段，全程离线。
+
+**首次运行会自动下载两个模型**（之后缓存复用）：
+
+| 模型 | 用途 | 大小 | 下载源 |
+|------|------|------|--------|
+| Whisper large-v3（CTranslate2 格式） | 语音识别 | ~3.1GB | HuggingFace 或 ModelScope |
+| ct-punc（CT-Transformer） | 标点恢复 | ~1.05GB | ModelScope（自动） |
+
+**硬件要求（纯 CPU 即可，无需显卡）**：
+
+| 配置档 | CPU | 内存 | 适用性 |
+|--------|-----|------|--------|
+| 最低 | 4 核 x86-64（2018 年后） | 8GB | 能跑，耗时约为音频时长的 6-8 倍 |
+| 推荐 | 8 核+（如 i5-1240P / R7-5800U / M1 及以上） | 16GB | 耗时约为音频时长的 3-3.5 倍 |
+| 宽裕 | 12 核+ 高频 / Apple Silicon | 16GB+ | 耗时约为音频时长的 2-3 倍 |
+
+> 内存占用峰值约 4-5GB（识别模型 ~3GB + 标点模型 ~1.5GB）。若内存不足 8GB，建议改用云端百炼 ASR。
+
+**耗时预估公式**：`转录耗时 ≈ 音频时长 × 实时率倍数 + 约 30 秒模型加载`。
+
+实测参考（i5-1240P / 8 线程 / int8）：5 分钟节目约 15-18 分钟，1 小时节目约 3-3.5 小时。标点恢复很快（约 150 字/秒），占比可忽略。
+
+> 提示：`cpu_threads`（默认 8）可按 CPU 物理核心数调整；`beam_size` 默认 1（中文场景质量与 beam=5 几乎无差、速度快 35%）。详见 `config/config.example.json` 的 `asr` 节注释。
+
+### 3. 百炼 ASR（可选）
+
+如果本地 CPU 太慢或你希望更快完成转录，可切换到百炼（DashScope）Paraformer：
 
 ```bash
 cp config/config.example.json config/config.json
-# 编辑 config.json 填入百炼 API Key，或设置环境变量
-export DASHSCOPE_API_KEY=sk-your-key-here
 ```
 
-API Key 获取：[阿里云百炼控制台](https://dashscope.console.aliyun.com/apiKey)
+编辑 `config.json`：
 
-### 3. 转录播客
+```json
+{
+  "asr": {
+    "backend": "bailian"
+  },
+  "bailian": {
+    "api_key": "你的百炼 API Key",
+    "model": "paraformer-v2"
+  }
+}
+```
+
+`api_key` 也支持从环境变量 `DASHSCOPE_API_KEY` 读取，避免写入配置文件。
+
+### 本地转录 vs 云端转录：怎么选
+
+两种后端输出格式完全一致（句级分段 + 时间戳 + Markdown/PDF），可随时切换。对照你的机器情况选择：
+
+| 维度 | 本地（faster-whisper + ct-punc） | 云端（百炼 Paraformer） |
+|------|----------------------------------|------------------------|
+| 速度 | 约音频时长的 2-8 倍（取决于 CPU） | 约音频时长的 0.1-0.2 倍，1 小时节目几分钟 |
+| 费用 | 免费 | 按调用量计费（有免费额度） |
+| 隐私 | 音频不离开本机 | 音频上传云端 |
+| 网络 | 仅首次需下载模型 | 全程需要网络 |
+| 门槛 | 需 8GB+ 内存的 CPU | 需申请百炼 API Key |
+| 质量 | large-v3 + 标点恢复，句级分段 | Paraformer-v2，句级分段 |
+
+**按机器配置的推荐**：
+
+- **内存 ≥ 16GB、近 5 年的 8 核+ CPU** → 本地转录。质量与云端相当，免费且私密；短节目（<20 分钟）等待完全可接受
+- **内存 8-16GB、4-8 核 CPU** → 本地可用但偏慢。短节目用本地，1 小时以上的长节目建议云端，或本地挂机过夜
+- **内存 < 8GB / 老旧 CPU / 需要立即拿到结果** → 云端百炼 ASR
+- **内容敏感、不能上传** → 本地（无其他选项）；若机器太弱，考虑换台更好的机器跑
+
+> 混合用法很常见：日常短节目本地跑，攒下来的长节目批量切到 `backend: bailian` 快速处理。
+
+### 4. 网络代理（可选）
+
+如果你的网络环境无法直连某些站点（如 YouTube），可配置 HTTP 代理。工具会在抓取元数据和下载音频时使用该代理；代理不可用时下载会自动回退为直连。
+
+编辑 `config.json`：
+
+```json
+{
+  "network": {
+    "proxy": "http://127.0.0.1:7897"
+  }
+}
+```
+
+也支持环境变量 `HTTPS_PROXY` / `HTTP_PROXY`（配置文件优先）。
+
+### 5. 转录播客
 
 ```bash
 # 从播客网页自动抓取
@@ -56,6 +144,9 @@ python main.py https://example.com/podcast/episode-42
 
 # 直接使用音频 URL（需手动提供标题）
 python main.py https://cdn.example.com/audio/ep42.mp3 --title "AI 的未来"
+
+# YouTube 视频（需已安装 yt-dlp；受限网络请配置 network.proxy）
+python main.py https://www.youtube.com/watch?v=VIDEO_ID
 
 # 仅抓取信息，不转录（预览用）
 python main.py --dry https://example.com/podcast/episode-42
@@ -96,8 +187,8 @@ _本文档由播客转录工具自动生成 · 仅供个人学习使用_
 ```text
 URL 输入
   │
-  ├─ podfetch.py      → 网页抓取：JSON-LD / OpenGraph / HTML5 audio
-  ├─ podtranscribe.py → 下载音频 → 百炼异步 ASR → 时间戳分段
+  ├─ podfetch.py      → 网页抓取：JSON-LD / OpenGraph / HTML5 audio；YouTube 链接走 yt-dlp
+  ├─ podtranscribe.py → 下载音频（可选代理）→ faster-whisper 识别 + ct-punc 标点恢复 → 句级时间戳分段
   ├─ podsummarize.py  → 组装 Markdown 文档
   └─ md2pdf.py        → Markdown → PDF（中英文混排）
   │
@@ -109,9 +200,9 @@ URL 输入
 ```
 ├── main.py               # CLI 入口
 ├── podfetch.py           # 通用元数据抓取
-├── podtranscribe.py      # 音频下载 + 阿里云百炼 ASR
+├── podtranscribe.py      # 音频下载 + 本地 faster-whisper 识别 + ct-punc 标点恢复
 ├── podsummarize.py       # 转录文档构建 + 输出管理
-├── podauth.py            # API Key 配置加载
+├── podauth.py            # 本地配置加载
 ├── md2pdf.py             # Markdown → PDF
 ├── SKILL.md              # AI Agent 技能描述（供智能体调用）
 ├── config/
@@ -127,20 +218,24 @@ URL 输入
 - OpenGraph（`og:audio`）
 - HTML5 `<audio>` 标签
 - 直接音频 URL（.mp3 / .m4a / .wav / .ogg / .aac / .flac / .opus）
+- YouTube 视频链接（经 yt-dlp 解析音频流，可选）
 
-已验证：小宇宙、Apple Podcasts、Spotify（网页版）、TWiT、Libsyn 托管播客等。
+已验证：小宇宙、Apple Podcasts、Spotify（网页版）、TWiT、Libsyn 托管播客、YouTube 等。
 
 ## 作为 AI Agent 技能使用
 
-本项目附带 `SKILL.md`，可直接作为智能体技能安装。智能体调用本工具完成转录后，利用自身模型能力生成摘要、话题分段、延伸阅读等——无需额外 LLM API 配置。
+本项目附带 `SKILL.md`，可直接作为智能体技能安装。智能体调用本工具完成转录后，利用自身模型能力生成摘要、话题分段、延伸阅读等——无需任何外部 API 配置。
 
 ## 常见问题
 
 **Q: 转录一集需要多久？**
-A: 下载 1-3 分钟 + 异步转录 5-15 分钟（取决于音频时长和服务负载）。1 小时播客总计约 10-20 分钟。
+A: 下载 1-3 分钟；本地转录耗时约为音频时长的 2-8 倍（取决于 CPU，8 核机型约 3-3.5 倍），1 小时播客约 3-4 小时；切到百炼云端则只需几分钟。详见上文「本地转录的机器要求与耗时预估」。
 
 **Q: 支持哪些语言？**
-A: 阿里云百炼 ASR 支持中文、英文、日文等多语种。
+A: Whisper large-v3 支持中文、英文、日文等多语种，ct-punc 标点恢复支持中英混合。建议为中文播客设置 `"language": "zh"`。
+
+**Q: 能转录 YouTube 上的播客吗？**
+A: 可以，直接传 YouTube 链接即可（需先 `pip install yt-dlp`）。若提示无法连接 YouTube，请在 `network.proxy` 中配置可用代理（如 Clash 的 `http://127.0.0.1:7897`）。
 
 **Q: PDF 中文乱码？**
 A: 需要 CJK 字体。Windows/macOS 通常自带；Linux 请安装 `fonts-wqy-zenhei`。
@@ -155,10 +250,8 @@ for url in $(cat urls.txt); do python main.py "$url"; done
 
 1. **元数据抓取**：从播客网页公开 HTML 提取标题、音频 URL（本地处理）
 2. **音频下载**：从播客 CDN 下载到本地 `audio_cache/`
-3. **语音转录**：音频上传至**阿里云百炼（DashScope）**进行异步识别
+3. **语音转录**：faster-whisper 识别 + ct-punc 标点恢复，全部在本地运行，音频不离开本机（选择百炼后端时音频会上传云端）
 4. **本地输出**：Markdown + PDF 保存在 `output/`
-
-步骤 3 会将音频数据传输到阿里云服务器。请确认您有权处理相关内容。
 
 ## 免责声明
 
